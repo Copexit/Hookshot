@@ -179,6 +179,26 @@ static int reserve_guest(void) {
                 if (p == (void *)A64_HOST_BASE) {
                     hos_guest_memfd = fd;
                     hos_log("mem: the guest window is a memfd's (%d), shared with the GPU as dma-bufs", fd);
+                    /* (local) HOS_HUGEMEM=1: 2 MB pages for the window, fewer TLB misses in the lifted code's guest loads.
+                       Only takes effect when /sys/kernel/mm/transparent_hugepage/shmem_enabled is advise or within_size
+                       (never by default). udmabuf pins large shmem folios whole (memfd_pin_folios); khugepaged cannot
+                       collapse pinned pages, and a hole punched under part of a pinned huge folio zeroes that part */
+                    {
+                        const char *h = getenv("HOS_HUGEMEM");
+                        if (h && atoi(h)) {
+                            char mode[96] = "?";
+                            FILE *f = fopen("/sys/kernel/mm/transparent_hugepage/shmem_enabled", "r");
+                            if (f) {
+                                if (!fgets(mode, sizeof mode, f)) mode[0] = 0;
+                                fclose(f);
+                                mode[strcspn(mode, "\n")] = 0;
+                            }
+                            const int r = madvise((void *)A64_HOST_BASE, GUEST_SPACE, MADV_HUGEPAGE);
+                            hos_log("mem: HOS_HUGEMEM: MADV_HUGEPAGE on the guest window %s (errno %d); shmem_enabled: %s%s", r ? "failed" : "ok",
+                                    r ? errno : 0, mode, strstr(mode, "[advise]") || strstr(mode, "[within_size]") || strstr(mode, "[always]")
+                                                             ? "" : " (no effect: needs advise or within_size)");
+                        }
+                    }
                     return 1;
                 }
                 if (p != MAP_FAILED) munmap(p, GUEST_SPACE);
@@ -1440,6 +1460,80 @@ static int game_main(int argc, char **argv) {
     return 0;
 }
 
+#ifdef __linux__
+/* (local) HOS_HUGETEXT=1: the executable's code on 2 MB pages. The game is ~444 MB of code, ~219 MB of it hot, on 4K
+   file pages: an iTLB/STLB miss on most calls. The part of the text mapping that is 2 MB aligned is copied into an
+   aligned anonymous region with MADV_HUGEPAGE (+ MADV_COLLAPSE), made read+exec, and moved over the original with
+   mremap. The contents never change, so code running from the range (other threads, the return to the caller) sees the
+   same bytes before and after; the copy routine still sits in a section of its own, outside the range. Any failure:
+   the original mapping stays. Costs: the range becomes private anonymous memory (all of it resident, ~444 MB, no
+   longer shared page cache); perf/tools that symbolize from /proc/self/maps no longer see the file for it (dladdr,
+   which prof.c and the crash report use, still works). */
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+#ifndef MREMAP_FIXED
+#define MREMAP_FIXED 2
+#endif
+#define HUGE_2M ((uintptr_t)2 << 20)
+__attribute__((noinline, section("hos_hugetext"))) static int hugetext_swap(uintptr_t lo, size_t n, int *collapsed) {
+    uint8_t *raw = mmap(NULL, n + HUGE_2M, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) return -1;
+    uint8_t *a = (uint8_t *)(((uintptr_t)raw + HUGE_2M - 1) & ~(HUGE_2M - 1));
+    if (a > raw) munmap(raw, (size_t)(a - raw));
+    if (a + n < raw + n + HUGE_2M) munmap(a + n, (size_t)(raw + n + HUGE_2M - (a + n)));
+    madvise(a, n, MADV_HUGEPAGE);
+    memcpy(a, (const void *)lo, n);
+    *collapsed = madvise(a, n, MADV_COLLAPSE) == 0;   /* (Linux 6.1+; the faults above may already have made huge pages) */
+    if (mprotect(a, n, PROT_READ | PROT_EXEC) ||
+        mremap(a, n, n, MREMAP_MAYMOVE | MREMAP_FIXED, (void *)lo) != (void *)lo) {
+        munmap(a, n);
+        return -1;
+    }
+    return 0;
+}
+static void hugetext(void) {
+    const char *e = getenv("HOS_HUGETEXT");
+    if (!e || !atoi(e)) return;
+    const uintptr_t self = (uintptr_t)&hos_log, fn = (uintptr_t)&hugetext_swap;   /* (hos_log: any function in .text) */
+    uintptr_t s = 0, t = 0, lo, hi;
+    char line[512];
+    FILE *f = fopen("/proc/self/maps", "r");
+    while (f && fgets(line, sizeof line, f)) {
+        unsigned long a, b;
+        char perms[8] = "";
+        if (sscanf(line, "%lx-%lx %7s", &a, &b, perms) == 3 && perms[2] == 'x' && self >= a && self < b) {
+            s = a, t = b;
+            break;
+        }
+    }
+    if (f) fclose(f);
+    lo = (s + HUGE_2M - 1) & ~(HUGE_2M - 1), hi = t & ~(HUGE_2M - 1);
+    if (fn >= lo && fn < hi) hi = fn & ~(HUGE_2M - 1);   /* (the copy routine stays outside the range it replaces) */
+    if (!s || hi <= lo) {
+        hos_log("mem: HOS_HUGETEXT: no 2 MB aligned part of the code mapping (%#lx..%#lx): 4K pages", (unsigned long)s, (unsigned long)t);
+        return;
+    }
+    int collapsed = 0;
+    if (hugetext_swap(lo, hi - lo, &collapsed)) {
+        hos_log("mem: HOS_HUGETEXT: remap of %#lx..%#lx failed (errno %d): 4K pages", (unsigned long)lo, (unsigned long)hi, errno);
+        return;
+    }
+    unsigned long huge_kb = 0;
+    f = fopen("/proc/self/smaps", "r");
+    int in = 0;
+    while (f && fgets(line, sizeof line, f)) {
+        unsigned long a, b, kb;
+        if (sscanf(line, "%lx-%lx ", &a, &b) == 2) in = a >= lo && b <= hi;   /* (a mapping's first line; fields are "Name: ...") */
+        else if (in && sscanf(line, "AnonHugePages: %lu kB", &kb) == 1) huge_kb += kb;
+    }
+    if (f) fclose(f);
+    hos_log("mem: HOS_HUGETEXT: code %#lx..%#lx (%lu MB of the %lu MB mapping) on anonymous memory, MADV_COLLAPSE %s, "
+            "AnonHugePages %lu MB", (unsigned long)lo, (unsigned long)hi, (unsigned long)((hi - lo) >> 20),
+            (unsigned long)((t - s) >> 20), collapsed ? "ok" : "failed", huge_kb >> 10);
+}
+#endif
+
 #ifndef _WIN32
 /* (linux) The window belongs on the process's main thread (SDL), so the game runs on a thread of its own, with the
    stack the guest main thread's lifted code needs (the main thread has the system's 8 MB): host/posix/display_sdl.c */
@@ -1453,6 +1547,9 @@ int main(int argc, char **argv) {
     int hos_display_init(void);
     void hos_display_loop(void);
     load_hookshot_env();
+#ifdef __linux__
+    hugetext();   /* (local) before the window and the game's threads */
+#endif
     game_argc = argc, game_argv = argv;
     const int window = hos_display_init();
     HANDLE t = CreateThread(NULL, 64u << 20, game_thread, NULL, 0, NULL);
