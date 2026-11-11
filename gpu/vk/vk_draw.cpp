@@ -6626,6 +6626,138 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
          out_of_time.load() ? " (the time budget, RX_VK_PREDICT_S, ran out: the rest are built in play)" : "");
 }
 
+/// (local) RX_VK_NO_GAME_AA=1: OoT's post anti-aliasing (SMAA-like, at the end of the scene) left out: its edge detection
+/// (into a 256x144 tile mask, ~0.30 ms) not run, and its blend weights pass (into an RGBA8 1024x576 image, ~0.25 ms) replaced by a
+/// clear of its storage images to 0, so the final blend (which keeps the colour of a pixel whose weights are all under 1e-5)
+/// passes the scene through unchanged. The two program keys are not shipped: RX_VK_GAME_AA_KEYS=<edge>,<weights> (hex, as the
+/// program log prints them). Whether the dispatch was handled. Off by default
+bool no_game_aa(VkCommandBuffer cmd, NvnState& s, uint64_t key) {
+    const bool on = hc_flag[HC_NO_GAME_AA] != 0;
+    if (!on) return false;
+    static uint64_t edge_key, weights_key;
+    static const bool keys = [] {
+        const char* v = getenv("RX_VK_GAME_AA_KEYS");
+        if (!v) return false;
+        char* end = nullptr;
+        edge_key = strtoull(v, &end, 16);
+        if (end && *end == ',') weights_key = strtoull(end + 1, nullptr, 16);
+        return edge_key && weights_key;
+    }();
+    if (!keys) return false;
+    if (key == edge_key) return true;
+    if (key != weights_key) return false;
+    uint32_t ntex = 0, nimg = 0;   // (the program's own image slots; later ones hold other passes' bindings)
+    cs_slot_counts(s, &ntex, &nimg);
+    bool begun = false;
+    for (uint32_t i = 0; i < std::min(nimg, 32u); i++) {
+        nvn_tex t;
+        nvn_view v;
+        bool hv = false;
+        if (!s.img[5][i] || !texture_of((int)(s.img[5][i] & 0xFFFFF), &t, &v, &hv)) continue;
+        Texture* tex = texture_get(&t, false);
+        if (!tex || !tex->image || tex->aspect != VK_IMAGE_ASPECT_COLOR_BIT) continue;
+        if (!begun) end_pass(cmd), full_barrier(cmd), begun = true;
+        const VkClearColorValue zero{};
+        const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        vkCmdClearColorImage(cmd, tex->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+        texture_written(tex);
+    }
+    if (begun) full_barrier(cmd);
+    return true;
+}
+
+// (hillclimb) RX_VK_DISPATCH_INDEP=1: the barrier before a dispatch is left out when the dispatches since the last barrier on this
+// command buffer (nothing else recorded in between) wrote nothing it reads or writes and read nothing it writes. Only for dispatches
+// whose memory is all known: programs with no global memory, texel buffers or image writes (every storage buffer a single one from
+// a constant buffer word: its binding is what the shader can reach), and OoT's particle step (one 256-byte record
+// a thread in its own storage buffer, and two words of global memory at c0+0xc0 + c1[0], -16 and +0). A game barrier held back by
+// RX_VK_BARRIER_DEFER=1 between two such dispatches is left out with it (any later work has a barrier of its own). OoT runs ~56
+// particle emitters a frame as 1x1x1 dispatches, each behind a full barrier. Off by default
+struct IndepRange { uint64_t lo, hi; };
+struct IndepRun {
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    uint64_t epoch = 0;
+    int nr = 0, nw = 0;
+    IndepRange r[96], w[32];   // (what the run's dispatches read (writes included) and wrote)
+};
+thread_local IndepRun indep_run;
+std::atomic<int64_t> st_indep_left_out{0};
+
+/// This dispatch's reads (writes included) and writes, false: not all known
+static bool indep_sets(const NvnState& s, const Program& p, uint32_t x, uint64_t indirect, std::vector<IndepRange>& r,
+                       std::vector<IndepRange>& w) {
+    static const bool wide = getenv("RX_VK_SSBO_STRETCH") || getenv("RX_VK_SSBO_WIDE");   // (bindings past the size word)
+    if (indirect || wide || p.stages.empty()) return false;
+    const Stage& st = p.stages[0];
+    const auto& in = st.info;
+    if (in.stores_global_memory || in.native_global_bounds || !in.texture_buffer_descriptors.empty() || !in.image_buffer_descriptors.empty())
+        return false;
+    for (const auto& d : in.image_descriptors)
+        if (d.is_written) return false;
+    const auto word64 = [&](uint32_t index, uint32_t off) {
+        return stage_cbuf_word(s, st, index, off) | (uint64_t)stage_cbuf_word(s, st, index, off + 4) << 32;
+    };
+    const auto& sd = in.storage_buffers_descriptors;
+    // (the particle step's program key is not shipped: RX_VK_INDEP_PARTICLE_KEY=<hex>, as the program log prints it; unset, only
+    // the general rule below applies)
+    static const uint64_t particle_key = getenv("RX_VK_INDEP_PARTICLE_KEY") ? strtoull(getenv("RX_VK_INDEP_PARTICLE_KEY"), nullptr, 16) : 0;
+    if (particle_key && p.key == particle_key) {   // (its SPIR-V: stores only to ssbo0, element (group * 64 + thread) * 256 + 128..247)
+        if (sd.size() != 2 || sd[0].cbuf_index != 0 || sd[0].cbuf_offset != 0x150 || sd[0].count != 1 || sd[1].cbuf_offset != 0x880 ||
+            sd[1].is_written)
+            return false;
+        const uint64_t a = word64(0, 0x150), size = stage_cbuf_word(s, st, 0, 0x158);
+        const uint64_t g = word64(0, 0xc0) + word64(1, 0);   // (the global word it reads, and the one 16 bytes before)
+        if (!a || g < 16) return false;
+        const IndepRange own{a & ~255ull, a + std::max<uint64_t>(size, (uint64_t)std::max(x, 1u) * 0x4000) + 256};
+        w.push_back(own), r.push_back(own), r.push_back({g - 16, g + 4});
+        return true;
+    }
+    if (in.uses_global_memory) return false;
+    for (const auto& d : sd) {
+        if (d.count != 1 || (d.cbuf_index == 0 && d.cbuf_offset == 0xff0)) return false;
+        const uint64_t a = word64(d.cbuf_index, d.cbuf_offset), size = stage_cbuf_word(s, st, d.cbuf_index, d.cbuf_offset + 8);
+        if (!a) continue;
+        const IndepRange b{a & ~255ull, a + std::max<uint64_t>(size, 16) + 256};   // (a superset of what build_descriptors binds)
+        r.push_back(b);
+        if (d.is_written) w.push_back(b);
+    }
+    for (const auto& d : in.constant_buffer_descriptors)   // (the game's uniform buffers: a storage write may land in one)
+        for (uint32_t k = 0; k < d.count; k++)
+            if (d.index + k >= 3 && d.index + k < 3 + 16) {
+                const nvn_p_bind_buf& u = s.ubo[5][d.index + k - 3];
+                if (u.addr) r.push_back({u.addr, u.addr + (u.size ? u.size : 0x10000)});
+            }
+    return true;
+}
+
+static bool indep_overlap(const IndepRange* a, int na, const std::vector<IndepRange>& b) {
+    for (int i = 0; i < na; i++)
+        for (const IndepRange& c : b)
+            if (a[i].lo < c.hi && c.lo < a[i].hi) return true;
+    return false;
+}
+
+/// Whether the barrier before this dispatch is left out (RX_VK_DISPATCH_INDEP); otherwise this dispatch starts a new run
+static bool indep_skip(VkCommandBuffer cmd, const NvnState& s, const Program& p, uint32_t x, uint64_t indirect) {
+    IndepRun& run = indep_run;
+    if (!hc_flag[HC_DISPATCH_INDEP]) return run.cmd = VK_NULL_HANDLE, false;
+    std::vector<IndepRange> r, w;
+    if (!indep_sets(s, p, x, indirect, r, w)) return run.cmd = VK_NULL_HANDLE, false;
+    const bool chained = run.cmd == cmd && run.epoch == work_epoch.load(std::memory_order_relaxed);
+    const bool fits = chained && run.nr + (int)r.size() <= 96 && run.nw + (int)w.size() <= 32;
+    const bool skip = fits && !indep_overlap(run.w, run.nw, r) && !indep_overlap(run.r, run.nr, w);
+    if (!skip) run.cmd = cmd, run.nr = run.nw = 0;
+    for (const IndepRange& q : r) run.r[run.nr++] = q;
+    for (const IndepRange& q : w) run.w[run.nw++] = q;
+    if (!skip) return false;
+    if (barrier_pending_cmd == cmd) barrier_pending_cmd = VK_NULL_HANDLE;   // (the game's, held back: it orders nothing more here)
+    const int64_t n = st_indep_left_out.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!(n & (n - 1)))
+        logf("vk: dispatch barriers left out (RX_VK_DISPATCH_INDEP): %lld so far, %llu dispatches (this one %016llx)", (long long)n,
+             (unsigned long long)st_dispatches, (unsigned long long)p.key);
+    return true;
+}
+
 void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
     PROF(PROF_DISPATCH);
     DispatchClock dclock;
@@ -6698,6 +6830,8 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     if ((!cp || cp->failed || slow_network) && upscale_stub(cmd, s, compute_code_key(s))) return void(st_dispatches++);
     if (slow_network) SKIP_HERE();   // (an earlier pass of the network: the stub is its last pass)
     if (!cp || !cp->ready.load(std::memory_order_acquire) || cp->failed) SKIP_HERE();
+    if (no_game_aa(cmd, s, cp->key)) return;   // (local, RX_VK_NO_GAME_AA)
+    if (hc_flag[HC_SKIP] && hc_skip(cp->key)) SKIP_HERE();   // (hillclimb, RX_VK_HC_SKIP: a frame cost map)
     {   // (hookshot, RX_VK_SKIP_PROG=<key prefix,...>: those programs' dispatches left out, for diagnosis)
         static const char* skip = getenv("RX_VK_SKIP_PROG");
         if (skip) {
@@ -6862,7 +6996,9 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     // (dispatches after other work wait for it: the WebGPU renderer's dispatches were ordered the same way by
     // wgpu's own tracking, and MKW's compute chains read what the one before wrote)
     static const bool no_order = getenv("RX_VK_NO_DISPATCH_ORDER") != nullptr;
-    if (work_since_barrier && !no_order) full_barrier(cmd, "barrier (dispatch)");
+    // (RX_VK_BARRIER_NARROW: a dispatch reads and writes only through L2, vk_texture.cpp record_barrier)
+    const bool indep = indep_skip(cmd, s, p, x, indirect);   // (hillclimb, RX_VK_DISPATCH_INDEP)
+    if (work_since_barrier && !no_order && !indep) consumer_barrier(cmd, "barrier (dispatch)", "barrier (dispatch, narrow)", true);
     work_since_barrier = true;
     if (!p.stages.empty() && p.stages[0].info.uses_cooperative_matrix) {   // (the game's networks, once each: what they read and write)
         static std::mutex mu;
@@ -6954,6 +7090,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             vkCmdDispatchIndirect(cmd, args.buffer, args.offset);
         } else {
             vkCmdDispatch(cmd, x, y, z);
+            if (indep_run.cmd == cmd) indep_run.epoch = work_epoch.load(std::memory_order_relaxed);   // (RX_VK_DISPATCH_INDEP)
         }
     }
     if (dump_on() && dump_ssbo_wanted(p.key)) dump_ssbos(cmd, p, "after");
