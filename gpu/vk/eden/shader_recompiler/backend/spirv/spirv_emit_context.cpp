@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <map>
+#include <set>
+#include <tuple>
 #include <array>
 #include <bit>
 #include <climits>
@@ -1206,6 +1208,38 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         OpBranch(end_label);
         AddLabel(end_label);
     }};
+    // (local, RX_VK_OOT_GMEM=1) the searches below with a cheaper test of each buffer, the same result. The old one,
+    // base <= addr < min(base + size + misalign, base + bound) in 64 bits, needs a 64-bit unsigned minimum the GFX9 scalar
+    // unit lacks (it went to the vector unit with copies), two 64-bit compares and their values held: about 33
+    // instructions a buffer, and a culling program tests ~13 buffers at each of its ~80 global accesses. Here the length is
+    // a 32-bit minimum of the size word (plus the base's misalignment, saturated) and the binding's length (always below
+    // 4 GB), and the test is distance = addr - base, high word 0 and low word below that length. Exact: the binding's
+    // length is below 4 GB, so a hit needs the distance below 4 GB; an address below the base wraps to a distance of
+    // 2^64 - (base - addr), whose high word is 0 only for a base above 2^64 - 2^32, which no buffer is bound at (the
+    // back end binds nothing there: length 0, no hit). Also: a table entry whose constant buffer word an earlier table
+    // entry of the same search already tested (one of OoT's culling setup programs binds four overlapping 16-entry
+    // tables of c4: 34 of its 74 tests) is left out when both tables are bound the same way by vk_draw.cpp (same word,
+    // both written or both read, not the 0x880 pointer table): same address, size and length, so it can never be the
+    // first match. Off: the SPIR-V is as before
+    static const bool oot_gmem{getenv("RX_VK_OOT_GMEM") && atoi(getenv("RX_VK_OOT_GMEM")) != 0};
+    const auto gmem_test{[&](Id addr, Id unaligned_addr, Id ssbo_addr, Id size_word, Id bound, bool bare_if_zero) {
+        const Id misalign{OpBitwiseAnd(U32[1], OpUConvert(U32[1], unaligned_addr),
+                                       Const(static_cast<u32>(profile.min_ssbo_alignment - 1U)))};
+        const Id sum{OpIAdd(U32[1], size_word, misalign)};
+        const Id raw{OpSelect(U32[1], OpULessThan(U1, sum, size_word), Const(~0U), sum)};
+        Id length{OpUMin(U32[1], raw, bound)};
+        if (bare_if_zero) {   // (a table entry without a size: the binding's length, as below)
+            length = OpSelect(U32[1], OpIEqual(U1, size_word, zero), bound, length);
+        }
+        const Id distance{OpISub(U64, addr, ssbo_addr)};
+        const Id low{OpUConvert(U32[1], distance)};
+        const Id high{OpUConvert(U32[1], OpShiftRightLogical(U64, distance, Const(32U)))};
+        return std::make_pair(low, OpLogicalAnd(U1, OpIEqual(U1, high, zero), OpULessThan(U1, low, length)));
+    }};
+    std::vector<bool> table_written;   // (by table, in ssbo_tables' order)
+    for (const auto& d : info.storage_buffers_descriptors) {
+        if (d.count > 1) table_written.push_back(d.is_written);
+    }
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
                                auto&& callback, bool add_label = true) {
         if (add_label) AddLabel();
@@ -1277,37 +1311,54 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
             const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
             const Id unaligned_addr{OpBitcast(U64, OpLoad(U32[2], ssbo_addr_pointer))};
             const Id ssbo_addr{OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask))};
+            const bool bounded{Sirit::ValidId(struct_pointer_of(ssbo_member)) && Sirit::ValidId(ssbos[index].*ssbo_member)};
+            Id cond{};
+            Id gmem_offset{};
+            if (oot_gmem && bounded) {   // (RX_VK_OOT_GMEM, above)
+                const Id size_word{OpLoad(U32[1], ssbo_size_pointer)};
+                const Id elements{OpArrayLength(U32[1], ssbos[index].*ssbo_member, 0U)};
+                std::tie(gmem_offset, cond) = gmem_test(addr, unaligned_addr, ssbo_addr, size_word,
+                                                        OpShiftLeftLogical(U32[1], elements, Const(shift)), false);
+            } else {
             const Id ssbo_size{OpUConvert(U64, OpLoad(U32[1], ssbo_size_pointer))};
             Id ssbo_end{OpIAdd(U64, unaligned_addr, ssbo_size)};
             // (EvilOOT) no further than what is bound: a buffer the back end could not bind is a null descriptor (length 0), and an
             // address in its range read 0 through it instead of going on to the page table (OoT's ambient light probes: 0, the
             // foliage and signs black)
-            if (Sirit::ValidId(struct_pointer_of(ssbo_member)) && Sirit::ValidId(ssbos[index].*ssbo_member)) {
+            if (bounded) {
                 const Id elements{OpArrayLength(U32[1], ssbos[index].*ssbo_member, 0U)};
                 const Id bound_end{OpIAdd(U64, ssbo_addr, OpUConvert(U64, OpShiftLeftLogical(U32[1], elements, Const(shift))))};
                 ssbo_end = OpSelect(U64, OpULessThan(U1, bound_end, ssbo_end), bound_end, ssbo_end);
             }
-            const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr),
-                                       OpULessThan(U1, addr, ssbo_end))};
+            cond = OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr),
+                                OpULessThan(U1, addr, ssbo_end));
+            }
             const Id then_label{OpLabel()};
             const Id else_label{OpLabel()};
             OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
             OpBranchConditional(cond, then_label, else_label);
             AddLabel(then_label);
             const Id ssbo_id{ssbos[index].*ssbo_member};
-            const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, ssbo_addr))};
+            const Id ssbo_offset{Sirit::ValidId(gmem_offset) ? gmem_offset : OpUConvert(U32[1], OpISub(U64, addr, ssbo_addr))};
             const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
             const Id ssbo_pointer{OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index)};
             callback(ssbo_pointer);
             AddLabel(else_label);
         }
-        for (const GlobalTableVars& table : ssbo_tables) {   // (hookshot: Info::global_tables)
+        std::set<std::tuple<u32, u32, bool, bool>> tested;   // (RX_VK_OOT_GMEM: the table entries searched so far)
+        for (size_t t = 0; t < ssbo_tables.size(); ++t) {   // (hookshot: Info::global_tables)
+            const GlobalTableVars& table{ssbo_tables[t]};
             const Id table_id{table.vars.*ssbo_member};
             if (!Sirit::ValidId(table_id) || !Sirit::ValidId(cbufs[table.cbuf_index].U32x2)) {
                 continue;
             }
+            const bool pointer_table{table.cbuf_index == 0 && table.cbuf_offset == 0x880 && table.count == 3};   // (vk_draw.cpp: bare)
             for (u32 k = 0; k < table.count; ++k) {
                 const u32 at{table.cbuf_offset + k * 16};
+                if (oot_gmem && t < table_written.size() &&
+                    !tested.emplace(table.cbuf_index, at, table_written[t], pointer_table).second) {
+                    continue;   // (an earlier table's entry, bound the same: never the first match)
+                }
                 const Id entry_pointer{OpAccessChain(uniform_types.U32x2, cbufs[table.cbuf_index].U32x2, zero,
                                                      Const(at / 8))};
                 const Id size_pointer{OpAccessChain(uniform_types.U32x2, cbufs[table.cbuf_index].U32x2, zero,
@@ -1316,6 +1367,13 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
                 const Id unaligned_addr{OpBitcast(U64, OpLoad(U32[2], entry_pointer))};
                 const Id ssbo_addr{OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask))};
                 const Id size_word{OpCompositeExtract(U32[1], OpLoad(U32[2], size_pointer), 0U)};
+                Id cond{};
+                Id gmem_offset{};
+                if (const Id struct_pointer{struct_pointer_of(ssbo_member)}; oot_gmem && Sirit::ValidId(struct_pointer)) {
+                    const Id elements{OpArrayLength(U32[1], OpAccessChain(struct_pointer, table_id, Const(k)), 0U)};
+                    std::tie(gmem_offset, cond) = gmem_test(addr, unaligned_addr, ssbo_addr, size_word,
+                                                            OpShiftLeftLogical(U32[1], elements, Const(shift)), true);
+                } else {
                 Id ssbo_end{OpIAdd(U64, unaligned_addr, OpUConvert(U64, size_word))};
                 // (EvilOOT) an entry without a size (OoT's culling setup keeps bare pointers, the size word 0: the back end
                 // binds those up to 1 MB of their pool, vk_draw.cpp): the binding's own length is the end
@@ -1328,13 +1386,14 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
                     const Id capped{OpSelect(U64, OpULessThan(U1, bound_end, ssbo_end), bound_end, ssbo_end)};
                     ssbo_end = OpSelect(U64, OpIEqual(U1, size_word, zero), bound_end, capped);
                 }
-                const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr), OpULessThan(U1, addr, ssbo_end))};
+                cond = OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr), OpULessThan(U1, addr, ssbo_end));
+                }
                 const Id then_label{OpLabel()};
                 const Id else_label{OpLabel()};
                 OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
                 OpBranchConditional(cond, then_label, else_label);
                 AddLabel(then_label);
-                const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, ssbo_addr))};
+                const Id ssbo_offset{Sirit::ValidId(gmem_offset) ? gmem_offset : OpUConvert(U32[1], OpISub(U64, addr, ssbo_addr))};
                 const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
                 callback(OpAccessChain(element_pointer, table_id, Const(k), zero, ssbo_index));
                 AddLabel(else_label);
