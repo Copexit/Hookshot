@@ -1996,7 +1996,7 @@ const Program* program_for(const NvnState& s, ProgramKind kind, const uint8_t co
     if (!s.has_prog) return nullptr;
     if (kind == ProgramKind::Mesh) return mesh_program_for(s, color_types);
     const bool compute = kind == ProgramKind::Compute;
-    static int64_t st_hit, st_none, st_differ, st_calls, st_by_tex;   // (logged now and then: how the cache does)
+    static thread_local int64_t st_hit, st_none, st_differ, st_calls, st_by_tex;   // (local: per thread, was a shared racy line)   // (logged now and then: how the cache does)
     if (++st_calls % 200000 == 0)
         logf("vk: program picks: %lld kept (%lld by the last picks' textures, a uniform buffer bound since), %lld new, %lld with other textures (of %lld)",
              (long long)st_hit, (long long)st_by_tex, (long long)st_none, (long long)st_differ, (long long)st_calls);
@@ -2006,9 +2006,15 @@ const Program* program_for(const NvnState& s, ProgramKind kind, const uint8_t co
     // draw: a draw of the same program with the same textures found its program through the full pick (the key, the answers' handles, a
     // compare). It stands now while the textures its answers are read from do (answer_stage_mask). RX_VK_PICK_BIND_GEN=1: as before
     static const bool by_bind = getenv("RX_VK_PICK_BIND_GEN") != nullptr;
+    // (local) RX_VK_PICK_UB_FREE=1: a pick whose answers are all handles in c2 of their own stages (answer_stage_mask, or no answers)
+    // stands whatever the stream's uniform updates did since (ub_generation, bumped by each NOP_UPDATE_UB): c2 is made from the
+    // stage's textures, samplers and images, which tex_gen covers, never from a uniform buffer. Off: an update between two draws
+    // of the same program sent the second through the full pick (picks map, answer_handles, compare)
+    const bool ub_free = hc_flag[HC_PICK_UB_FREE] != 0;
     for (const ProgFast& f : prog_fast) {   // (the draw before this one, and the one that took turns with it)
         if (!(f.on && f.p && f.p->ready.load(std::memory_order_acquire) && !f.p->failed)) continue;
         uint64_t fbind = f.bind;
+        const uint64_t fub = ub_free && !by_bind && !compute && f.amask != ~0u ? ub : f.ub;
         bool by_tex = false;
         if (fbind != bind && !by_bind && !compute && f.amask != ~0u) {
             by_tex = true;
@@ -2017,7 +2023,7 @@ const Program* program_for(const NvnState& s, ProgramKind kind, const uint8_t co
             if (by_tex) fbind = bind;
         }
         if (prog_same((int)kind, s.prog.serial, stages, bind, reg, ub, s.nvattr, s.vattr, color_types, f.kind, f.serial,
-                      f.stages, fbind, f.reg, f.ub, f.nvattr, f.vattr, f.ct)) {
+                      f.stages, fbind, f.reg, fub, f.nvattr, f.vattr, f.ct)) {
             st_by_tex += by_tex && f.bind != bind;
             return st_hit++, f.p;
         }

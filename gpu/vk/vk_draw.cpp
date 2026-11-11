@@ -1792,6 +1792,7 @@ struct HandleHit {
     uint64_t tex_epoch;   // (the texture epoch it was last touched in)
 };
 TLS_OBJECT(handle_hits, std::unordered_map<uint64_t, HandleHit>)
+thread_local uint64_t handle_hits_clears = 0;   // (local: bumped when this thread's handle_hits is emptied, RX_VK_DRY_MEMO's key)
 // (hookshot) RX_VK_TRACE_TEX=<w>x<h>,...: each draw sampling a texture of that size is logged with its state, every 30th frame, 600 lines: a
 // model that does not show is found by its textures, and whether the game draws it, and how, read from the line
 thread_local const Texture* trace_tex_hit = nullptr;
@@ -1835,27 +1836,43 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
     const uint64_t key = (uint64_t)(handle & 0xFFFFF) | (uint64_t)want << 20 | (uint64_t)use << 28 | (uint64_t)storage_as << 32;
     static const bool log_hits = getenv("RX_VK_LOG_HITS") != nullptr;
     static int64_t st_hit, st_new, st_ver, st_gen, st_n;
-    const auto it = handle_hits().find(key);
+    // (local) RX_VK_HIT_FRONT=1: a direct-mapped table of this thread's last finds in front of the map (a modulo and a node
+    // chase each texture of each build). It keeps pointers to the map's elements: they stand until the map is emptied (rehash
+    // keeps them; nothing erases one), and the one clear bumps handle_hits_clears, which the table entries carry
+    const bool front_on = hc_flag[HC_HIT_FRONT] != 0;
+    struct HitFront { uint64_t key; HandleHit* hit; uint64_t clears; };
+    static thread_local HitFront front[1024];
+    HitFront* fr = front_on ? &front[(key * 0x9E3779B97F4A7C15ull) >> 54] : nullptr;   // (off: not touched)
+    HandleHit* hh = nullptr;
+    if (fr && fr->hit && fr->key == key && fr->clears == handle_hits_clears) {
+        hh = fr->hit;
+    } else {
+        const auto it = handle_hits().find(key);
+        if (it != handle_hits().end()) {
+            hh = &it->second;
+            if (fr) *fr = {key, hh, handle_hits_clears};
+        }
+    }
     if (log_hits) {   // (the counters were a second search of this map on every binding, with the log off)
         if (++st_n % 200000 == 0)
             logf("vk: handle hits %lld, new %lld, slot re-registered %lld, a texture destroyed %lld", (long long)st_hit,
                  (long long)st_new, (long long)st_ver, (long long)st_gen);
-        if (it == handle_hits().end()) st_new++;
-        else if (it->second.version != version) st_ver++;
-        else if (it->second.destroy_gen != dgen) st_gen++;
+        if (!hh) st_new++;
+        else if (hh->version != version) st_ver++;
+        else if (hh->destroy_gen != dgen) st_gen++;
         else st_hit++;
     }
-    if (it != handle_hits().end() && it->second.version == version && it->second.destroy_gen == dgen) {
-        if (it->second.tex && it->second.tex_epoch != texture_epoch()) {   // (once a submission: its age and contents)
-            if (!texture_touch_quick(it->second.tex, it->second.sampling)) {
+    if (hh && hh->version == version && hh->destroy_gen == dgen) {
+        if (hh->tex && hh->tex_epoch != texture_epoch()) {   // (once a submission: its age and contents)
+            if (!texture_touch_quick(hh->tex, hh->sampling)) {
                 ParLock lk;
-                texture_touch(it->second.tex, it->second.sampling);
+                texture_touch(hh->tex, hh->sampling);
             }
-            it->second.tex_epoch = texture_epoch();
+            hh->tex_epoch = texture_epoch();
         }
-        if (tex_out) *tex_out = it->second.tex;
-        if (level_out) *level_out = it->second.level;
-        return it->second.view;
+        if (tex_out) *tex_out = hh->tex;
+        if (level_out) *level_out = hh->level;
+        return hh->view;
     }
     ParLock lk;
     nvn_tex t;
@@ -1883,7 +1900,9 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
                      has_view && v.set_format ? v.format : 0, has_view && v.set_target ? v.target : -1, (int)want, (int)use);
         }
     }
-    handle_hits()[key] = {view, tex, level, version, dgen, use == ViewUse::Sample || use == ViewUse::Storage, texture_epoch()};
+    HandleHit& made = handle_hits()[key];
+    made = {view, tex, level, version, dgen, use == ViewUse::Sample || use == ViewUse::Storage, texture_epoch()};
+    if (fr) *fr = {key, &made, handle_hits_clears};
     if (tex_out) *tex_out = tex;
     if (level_out) *level_out = level;
     return view;
@@ -2032,6 +2051,34 @@ struct DescWriter {
 TLS_OBJECT(dw, DescWriter)
 TLS_OBJECT(draw_sampled, std::vector<const Texture*>)   // (the textures the descriptors being built sample or store)
 TLS_OBJECT(gfx_sampled, std::vector<const Texture*>)    // (the last draw's: kept while its descriptors are reused)
+// (local) RX_VK_TEX_REUSE=1: a build for the same program as the last build (graphics and compute apart) keeps the last one's
+// sampled-texture descriptors when nothing they come from changed: every texture descriptor's handle in c2 of its stage (no handle
+// program), that stage's textures, samplers and images (tex_gen; bind_gen past stage 4, as the bank cache), no slot registered
+// or released, no sampler registration changed, no texture destroyed, the same recording and texture epoch. Then
+// texture_view_of would hit with no touch and sampler_for would hit, so the result is the one computed: only gpu_written is
+// looked at again (the draw's sampled list). Most draws bind a new uniform buffer (bind_gen), not new textures
+struct TexMemo {
+    const Program* prog = nullptr;
+    bool ok = false;
+    uint64_t reg = 0, samp = 0, dgen = 0, rec = 0;
+    uint32_t epoch = 0;
+    const void* res = nullptr;
+    std::vector<uint64_t> gen;                 // (each stage's, p.stages order)
+    std::vector<VkDescriptorImageInfo> imgs;   // (every texture descriptor, in build order)
+    std::vector<Texture*> tex;                 // (its texture when it has a view)
+    int64_t dummies = 0;
+};
+TLS_OBJECT(tex_memo, std::array<TexMemo, 2>)   // [graphics, compute]
+uint64_t tex_stage_gen(const NvnState& s, const Stage& st) {
+    const int k = std::clamp(st.nvn_stage, 0, kNvnStages - 1);
+    return k > 4 ? s.bind_gen : s.tex_gen[k];
+}
+bool tex_c2_only(const Program& p) {
+    for (const Stage& st : p.stages)
+        for (const auto& d : st.info.texture_descriptors)
+            if (d.handle_program != ~0U || d.cbuf_index != 2 || (d.has_secondary && d.secondary_cbuf_index != 2)) return false;
+    return true;
+}
 
 /// Fills dw with the program's descriptors for the bound state (bindings in Eden's order). Storage the program
 /// writes is noted: textures it stores into are GPU-written, buffers it stores into are stamped (vk_memory.cpp).
@@ -2175,6 +2222,32 @@ void build_descriptors(const NvnState& s, const Program& p) {
     }
     dw().bufs.reserve(nbuf), dw().imgs.reserve(nimg), dw().views.reserve(nview);   // (stable pointers below)
     FINE_N(FC_DESCS, (int64_t)(nbuf + nimg + nview));
+    // (RX_VK_TEX_REUSE, TexMemo: the keys read before any lookup, so a registration during the build makes the next one miss)
+    const bool tex_reuse_on = hc_flag[HC_TEX_REUSE] != 0;
+    static const bool tex_debug_env = getenv("RX_VK_LOG_IMG") || getenv("RX_VK_TRACE_TEX");
+    TexMemo& tm = tex_memo()[p.compute ? 1 : 0];
+    bool tex_use = false, tex_rec = false;
+    size_t tex_i = 0;
+    if (tex_reuse_on && !tex_debug_env && !dump_on() && !watch_prog()) {
+        const uint64_t reg = registrations_generation(), samp = sampler_registrations_generation(),
+                       dgen = texture_destroy_generation();
+        const uint32_t epoch = texture_epoch();
+        tex_use = tm.ok && tm.prog == &p && tm.reg == reg && tm.samp == samp && tm.dgen == dgen && tm.epoch == epoch &&
+                  tm.rec == rec_value && tm.res == cur && tm.gen.size() == p.stages.size();
+        for (size_t i = 0; tex_use && i < p.stages.size(); i++) tex_use = tm.gen[i] == tex_stage_gen(s, p.stages[i]);
+        if (!tex_use) {
+            tm.ok = false;
+            tex_rec = tex_c2_only(p);
+            if (tex_rec) {
+                tm.prog = &p, tm.reg = reg, tm.samp = samp, tm.dgen = dgen, tm.epoch = epoch, tm.rec = rec_value, tm.res = cur;
+                tm.gen.clear();
+                for (const Stage& st : p.stages) tm.gen.push_back(tex_stage_gen(s, st));
+                tm.imgs.clear(), tm.tex.clear(), tm.dummies = 0;
+            }
+        }
+    } else {
+        tm.ok = false;
+    }
     uint32_t binding = 0;
     auto write = [&](VkDescriptorType type, uint32_t count) {
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -2459,6 +2532,15 @@ void build_descriptors(const NvnState& s, const Program& p) {
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, d.count);
             const size_t first = dw().imgs.size();
             const VkImageViewType vt = view_type(d.type);
+            if (tex_use) {   // (RX_VK_TEX_REUSE: the last build's, as computed)
+                for (uint32_t k = 0; k < d.count; k++, tex_i++) {
+                    if (Texture* tex = tm.tex[tex_i]; tex && tex->gpu_written) draw_sampled().push_back(tex);
+                    dw().imgs.push_back(tm.imgs[tex_i]);
+                }
+                w.pImageInfo = &dw().imgs[first];
+                dw().writes.push_back(w);
+                continue;
+            }
             for (uint32_t k = 0; k < d.count; k++) {
                 // (Fritchii d603d98bb) A handle word where a storage buffer of the same program keeps its address is not a
                 // handle: OoT's water samples each light's texture with a handle loaded per pixel from the light buffer, and
@@ -2498,8 +2580,10 @@ void build_descriptors(const NvnState& s, const Program& p) {
                                tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->layers : 0, tex ? (void*)tex->image : nullptr,
                                (void*)view, view ? "" : " (dummy)");
                 if (view && tex && tex->gpu_written) draw_sampled().push_back(tex);
+                if (tex_rec) tm.tex.push_back(view ? tex : nullptr), tm.dummies += !view && handle != 0;
                 if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
                 dw().imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth), view, VK_IMAGE_LAYOUT_GENERAL});
+                if (tex_rec) tm.imgs.push_back(dw().imgs.back());
             }
             w.pImageInfo = &dw().imgs[first];
             dw().writes.push_back(w);
@@ -2540,6 +2624,8 @@ void build_descriptors(const NvnState& s, const Program& p) {
             dw().writes.push_back(w);
         }
     }
+    if (tex_use) st_dummy_textures += tm.dummies;
+    if (tex_rec) tm.ok = true;
 }
 
 /// Binds the descriptors built: pushed, or a set from the recording's pool
@@ -3669,7 +3755,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     if (value != hits_value) {            // collected between them; resolved handles last while their slot and
         hits_value = value;               // texture do, and are touched again once a submission)
         targets_serial = ~0ull;
-        if (handle_hits().size() > 65536) handle_hits().clear();
+        if (handle_hits().size() > 65536) handle_hits().clear(), handle_hits_clears++;
     }
     for (auto& row : bank_cache())
         for (BankCache& c : row) c = BankCache{}, c.at = UINT64_MAX;
@@ -5737,15 +5823,25 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     } else if (d.indexed) {
         const uint32_t unit = d.itype == 0 ? 1 : d.itype == 1 ? 2 : 4;
         BufferRef ib;
+        uint32_t first_index = 0;
         {
             FINE_SCOPE(FT_VERTEX);
             ib = gpu_buffer_bind(d.ibuf, (uint64_t)std::max(d.count, 1) * unit, false);
             if (!ib) SKIP_HERE();
             FINE_N(FC_IBIND, 1);
-            bind_index(cmd, ib.buffer, ib.offset, itype);
+            // (local) RX_VK_IB_FIRST=1: the index buffer bound at offset 0 of its buffer and the draw's offset given as its first
+            // index (the same bytes: offset + first * size), so draws of one pool's meshes keep one binding instead of one each
+            // (~0.9 binds a draw, and RADV re-emits the index base and size at the draw after each). Only when the offset is a
+            // whole number of indices and fits; otherwise bound at the offset, as before
+            const bool ib_first = hc_flag[HC_IB_FIRST] != 0;
+            if (ib_first && ib.offset % unit == 0 && ib.offset / unit + (uint64_t)std::max(d.count, 1) <= 0xFFFFFFFFull)
+                first_index = (uint32_t)(ib.offset / unit), bind_index(cmd, ib.buffer, 0, itype);
+            else
+                bind_index(cmd, ib.buffer, ib.offset, itype);
         }
         FINE_SCOPE(FT_DRAWCALL);
-        vkCmdDrawIndexed(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), 0, d.base_vertex, (uint32_t)d.base_instance);
+        vkCmdDrawIndexed(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), first_index, d.base_vertex,
+                         (uint32_t)d.base_instance);
     } else {
         FINE_SCOPE(FT_DRAWCALL);
         vkCmdDraw(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), (uint32_t)d.first, (uint32_t)d.base_instance);

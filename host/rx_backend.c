@@ -68,14 +68,63 @@ int hos_gpu_guest_ranges(uint64_t (*out)[2], int max);
 /* The soft write watch's marks (rt/a64.h A64_MARK, hos_mark_written) over the GPU-visible ranges, read and cleared:
    the Vulkan back end's own collection (gpu/render's rx_collect_written works only with the WebGPU renderer started).
    One consumer: with Vulkan the WebGPU renderer never runs. */
+/* (local) RX_VK_SCAN_FAST=1: the scan's ~3100 ranges (~230 bytes of marks each, scattered over the 128 MB table) were one
+   cache and TLB miss after another, ~0.2 ms a submit for ~0.7 MB of marks: the marks of the ranges ahead are prefetched
+   while one is scanned, and clean marks are skipped 64 at a time. =2: also 2 MB pages for the parts of the mark table
+   the scans touch (MADV_HUGEPAGE + MADV_COLLAPSE, once per 2 MB of table; fewer TLB misses for the game's marks too).
+   The same marks are read and cleared the same way: only the reading is faster */
+#ifndef _WIN32
+#include <sys/mman.h>
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+#endif
+static int scan_fast(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("RX_VK_SCAN_FAST") ? atoi(getenv("RX_VK_SCAN_FAST")) : 0;
+    return v;
+}
+static void marks_huge(uint64_t p0, uint64_t p1) {   /* (the 2 MB pieces of the table holding marks [p0, p1)) */
+#ifndef _WIN32
+    static unsigned char done[A64_DIRTY_PAGES >> 21];
+    for (uint64_t c = p0 >> 21; c <= (p1 - 1) >> 21 && c < sizeof done; c++) {
+        if (done[c]) continue;
+        done[c] = 1;   /* (tried once: a piece the kernel refuses stays as it is) */
+        const uintptr_t a = ((uintptr_t)&a64_dirty[c << 21] + (2u << 20) - 1) & ~(uintptr_t)((2u << 20) - 1);
+        if (a + (2u << 20) > (uintptr_t)a64_dirty + A64_DIRTY_PAGES) continue;
+        madvise((void *)a, 2u << 20, MADV_HUGEPAGE);
+        madvise((void *)a, 2u << 20, MADV_COLLAPSE);
+    }
+#else
+    (void)p0, (void)p1;
+#endif
+}
 static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **pages) {
     size_t n = 0, cap = 4096;
     uint32_t *out = malloc(cap * sizeof *out);
+    const int fast = scan_fast();
+    enum { AHEAD = 6, AHEAD_LINES = 8 };   /* (ranges ahead, and at most this many 64-byte lines of each: long ones stream) */
+    if (fast)
+        for (int r = 0; r < nranges && r < AHEAD; r++)
+            for (uint64_t q = ranges[r][0] >> 12, k = 0; q < (ranges[r][1] + 4095) >> 12 && q < A64_DIRTY_PAGES && k < AHEAD_LINES; q += 64, k++)
+                __builtin_prefetch(&a64_dirty[q], 0, 3);
     for (int r = 0; r < nranges; r++) {
         const uint64_t lo = ranges[r][0], hi = ranges[r][1] < hos_guest_size() ? ranges[r][1] : hos_guest_size();
         uint64_t p1 = (hi + 4095) >> 12;
         if (p1 > A64_DIRTY_PAGES) p1 = A64_DIRTY_PAGES;
+        if (fast && r + AHEAD < nranges)
+            for (uint64_t q = ranges[r + AHEAD][0] >> 12, k = 0; q < (ranges[r + AHEAD][1] + 4095) >> 12 && q < A64_DIRTY_PAGES && k < AHEAD_LINES; q += 64, k++)
+                __builtin_prefetch(&a64_dirty[q], 0, 3);
+        if (fast >= 2 && (lo >> 12) < p1) marks_huge(lo >> 12, p1);
         for (uint64_t p = lo >> 12; p < p1;) {
+            if (fast && !(p & 63) && p + 64 <= p1) {   /* (64 pages at a time while none is marked: two AVX2 loads) */
+                uint64_t w[8];
+                memcpy(w, &a64_dirty[p], 64);
+                if (!(w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7])) {
+                    p += 64;
+                    continue;
+                }
+            }
             if (!(p & 31) && p + 32 <= p1) {   /* (32 pages at a time while none is marked) */
                 uint64_t w[4];
                 memcpy(w, &a64_dirty[p], 32);

@@ -20,6 +20,7 @@
 #include <deque>
 #include <unordered_map>
 #include <thread>
+#include <immintrin.h>   // (RX_VK_CAP_NT's streaming stores)
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -89,8 +90,18 @@ struct SrwMutex {   // (a slim reader/writer lock: half std::mutex's cost, taken
     SRWLOCK l = SRWLOCK_INIT;
     void lock() { AcquireSRWLockExclusive(&l); }
     void unlock() { ReleaseSRWLockExclusive(&l); }
+    void lock_shared() { AcquireSRWLockShared(&l); }
+    void unlock_shared() { ReleaseSRWLockShared(&l); }
 };
 SrwMutex pools_mu;
+// (local) RX_VK_POOLS_SHARED=1: memory_read_as_submitted takes pools_mu shared. It only reads (cap_table, cap_bufs, the capture
+// buffers' mappings) and writes its thread's submitted_page; every writer of those (take_capture, cap_buf_retire, the mirror
+// syncs' last_use) and every other user keeps the exclusive lock, so the readers exclude only them. Off: exclusive, as before
+// (the replay workers waited ~0.3 ms a frame there for each other). On Linux the lock is a pthread rwlock, which prefers readers:
+// short reads, but a writer (the submit's take_capture, on the main thread) can wait for a gap between them
+bool pools_shared() {
+    return hc_flag[HC_POOLS_SHARED] != 0;   // (ReadLock keeps the answer it locked with: a flip between lock and unlock is safe)
+}
 uint32_t generation = ~0u;
 uint64_t align = 4096;
 uint64_t max_import_size = UINT64_MAX;
@@ -1001,16 +1012,27 @@ void shadow_drop_range(uint64_t lo, uint64_t hi) {   // (shadow_mu held)
     }
 }
 /// (the spans unused for 1800 presents dropped with their shadow pages; the rest published for the capture)
+// (local) RX_VK_SPAN_SCAN_LAZY=1: the walk over every span (thousands of map nodes, ~8 times a frame under pools_mu and shadow_mu,
+// ~0.6 ms a frame on the main and Presentation threads) only once one can be due. oldest is a lower bound of the spans' stamps:
+// memory_note_texture_upload only raises a stamp or adds a span at the frame now; 8 presents of slack for a frame number read
+// before shadow_mu. While frame <= oldest + 1800 no span is old enough, and the walk would have dropped nothing
 void publish_tex_spans(uint64_t frame) {
     std::lock_guard lk(shadow_mu);
-    for (auto it = tex_spans.begin(); it != tex_spans.end();) {
-        if (frame > it->second.second + 1800) {
-            shadow_drop_range(it->first, it->second.first);
-            it = tex_spans.erase(it);
-            tex_spans_changed = true;
-        } else {
-            ++it;
+    const bool lazy = hc_flag[HC_SPAN_SCAN_LAZY] != 0;
+    static uint64_t oldest = 0;
+    if (!lazy || frame > oldest + 1800) {
+        uint64_t low = frame;
+        for (auto it = tex_spans.begin(); it != tex_spans.end();) {
+            if (frame > it->second.second + 1800) {
+                shadow_drop_range(it->first, it->second.first);
+                it = tex_spans.erase(it);
+                tex_spans_changed = true;
+            } else {
+                low = std::min(low, it->second.second);
+                ++it;
+            }
         }
+        oldest = low > 8 ? low - 8 : 0;
     }
     if (!tex_spans_changed) return;
     tex_spans_changed = false;
@@ -1096,7 +1118,11 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
     static std::atomic<int64_t> reads{0}, pages_from{0};
     int64_t from = 0;
     {
-        std::lock_guard lk(pools_mu);
+        struct ReadLock {   // (RX_VK_POOLS_SHARED: shared, else exclusive as before)
+            const bool shared = pools_shared();
+            ReadLock() { shared ? pools_mu.lock_shared() : pools_mu.lock(); }
+            ~ReadLock() { shared ? pools_mu.unlock_shared() : pools_mu.unlock(); }
+        } lk;
         for (uint64_t page = guest >> kPageShift; page < (guest + n + 4095) >> kPageShift; page++) {
             const CapEntry e = cap_entry(page);
             if (!e.gen || e.gen != page_gen(page)) continue;
@@ -1291,9 +1317,43 @@ bool guarded_copy(void* dst, const void* src, size_t n) {
 // VirtualQuery per page took ~1 ms each in this address space: 22 ms a submit for 18 pages) (runs of adjacent pages
 // in one copy each, page by page only where a run fails; page i into slot i)
 struct CopyPart { const uint32_t* pages; int64_t i0, i1; uint8_t* out; uint8_t* ok; };
+// (local) RX_VK_CAP_NT=1: the pages copied into the capture buffer with streaming stores (linux, where the copy cannot fault:
+// guarded_copy is a plain memcpy there). The buffer is read next by the GPU's copies, and by take_capture for texture
+// pages only: a store that skips the cache saves reading each destination line first (a third of the copy's memory
+// traffic) and leaves the game's data in the cache. The same bytes land in the same slots
+bool copy_nt_on() {
+#if !defined(_WIN32) && defined(__AVX2__)
+    static const bool v = getenv("RX_VK_CAP_NT") != nullptr;
+    return v;
+#else
+    return false;
+#endif
+}
+#if !defined(_WIN32) && defined(__AVX2__)
+void copy_nt(uint8_t* dst, const uint8_t* src, size_t n) {   // (n: whole pages; dst 32-byte aligned)
+    for (size_t o = 0; o < n; o += 128) {
+        const __m256i a = _mm256_loadu_si256((const __m256i*)(src + o)), b = _mm256_loadu_si256((const __m256i*)(src + o + 32));
+        const __m256i c = _mm256_loadu_si256((const __m256i*)(src + o + 64)), d = _mm256_loadu_si256((const __m256i*)(src + o + 96));
+        _mm256_stream_si256((__m256i*)(dst + o), a), _mm256_stream_si256((__m256i*)(dst + o + 32), b);
+        _mm256_stream_si256((__m256i*)(dst + o + 64), c), _mm256_stream_si256((__m256i*)(dst + o + 96), d);
+    }
+}
+#endif
 void copy_part(const CopyPart& w) {
     uint8_t* const base = (uint8_t*)host->guest_base();   // (guest addresses: no GPU translation per page)
     const uint64_t gsize = host->guest_size();
+#if !defined(_WIN32) && defined(__AVX2__)
+    if (copy_nt_on() && !((uintptr_t)w.out & 31)) {
+        for (int64_t i = w.i0; i < w.i1; i++) {
+            const uint64_t ga = (uint64_t)w.pages[i] << kPageShift;
+            if (ga + 4096 > gsize) continue;
+            copy_nt(w.out + (uint64_t)i * 4096, base + ga, 4096);
+            w.ok[i] = 1;
+        }
+        _mm_sfence();   // (the streamed stores visible before the copy is reported done)
+        return;
+    }
+#endif
     for (int64_t i = w.i0; i < w.i1;) {
         const uint64_t ga = (uint64_t)w.pages[i] << kPageShift;
         if (ga + 4096 > gsize) { i++; continue; }
@@ -1549,13 +1609,24 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
             }
         if (!tex_merged.empty()) {
             // (every page written since the last capture: its old copy is stale; the ones copied now replace it)
-            for (uint32_t p : c->pages)
-                if (in_tex_merged((uint64_t)p << 12)) shadow_erase(p);
+            // (local) RX_VK_SHADOW_REUSE=1: a page copied now keeps its entry and 4 KB buffer, overwritten below, instead of
+            // being erased and made again: the game rewrites the same pages every frame, and ~400 frees, allocations and
+            // hash-map nodes a capture (and glibc trimming its heap after them) were most of a take's ~0.5 ms. A copied page
+            // the loop below does not reach (the cap) is erased after it, so no stale copy stays
+            static const bool reuse = getenv("RX_VK_SHADOW_REUSE") != nullptr;
+            static thread_local std::vector<uint8_t> is_copied;
+            if (reuse) {
+                is_copied.assign(c->pages.size(), 0);
+                for (uint32_t s : c->slots) is_copied[s] = 1;   // (slots: the copied page's index in pages)
+            }
+            for (size_t i = 0; i < c->pages.size(); i++)
+                if ((!reuse || !is_copied[i]) && in_tex_merged((uint64_t)c->pages[i] << 12)) shadow_erase(c->pages[i]);
             bool swept = false;
-            for (size_t i = 0; i < c->copied.size(); i++) {
+            size_t i = 0;
+            for (; i < c->copied.size(); i++) {
                 const uint32_t p = c->copied[i];
                 if (!in_tex_merged((uint64_t)p << 12)) continue;
-                if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax) {
+                if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax && !(reuse && shadow.count(p))) {
                     if (swept) break;
                     swept = true;
                     for (auto it = shadow.begin(); it != shadow.end();) {
@@ -1576,6 +1647,9 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 slot.seq = shadow_seq;
                 std::memcpy(slot.b.get(), (const uint8_t*)c->map + (uint64_t)c->slots[i] * 4096, 4096);
             }
+            if (reuse)   // (stopped at the cap: the copied pages left are stale in the shadow, as the erase above left them before)
+                for (; i < c->copied.size(); i++)
+                    if (in_tex_merged((uint64_t)c->copied[i] << 12)) shadow_erase(c->copied[i]);
         }
     }
     const auto tk1 = std::chrono::steady_clock::now();

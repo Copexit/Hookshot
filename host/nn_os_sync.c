@@ -191,21 +191,44 @@ static Obj *obj_lookup(uint64_t key, int kind);
    of the shared table and a cache miss on a scattered object). Game threads use a few objects over and over: a small
    direct-mapped cache per thread answers those. An entry holds while its object is still that address's and of the
    kind asked for (objects are reused, never freed: spares). HOS_NO_OBJ_CACHE=1: off. */
+/* (local) HOS_OBJ_CACHE=<entries> (rounded up to a power of two, 2048 to 16384): a bigger cache per thread, made on the
+   thread's first nn::os call. At the lake obj_lookup (the miss path: nearly every sample stalled loading the shared table's
+   slot) was 2-3% of the game threads' running time (~0.4 ms a frame on MainThread, ~1.7 ms over the workers), nearly all
+   from LockMutex in one caller (f_80364080) that goes through more mutexes than 1024 direct-mapped entries keep.
+   Unset: 1024 entries as before */
+typedef struct { uint64_t key; Obj *o; } ObjCacheEntry;
+static int obj_cache_bits(void) {
+    static int bits = -1;
+    if (bits < 0) {
+        const long n = getenv("HOS_OBJ_CACHE") ? atol(getenv("HOS_OBJ_CACHE")) : 0;
+        int b = 0;
+        if (n > 1024)
+            for (b = 11; b < 14 && (1L << b) < n; b++) {}
+        bits = b;
+    }
+    return bits;
+}
 static Obj *obj(uint64_t key, int kind) {
     hos_vcore_checkpoint();   /* (virtual cores: every nn::os call, where a better waiter takes the core) */
     /* (hookshot: 128 still missed: obj_lookup was the busiest leaf in dense Kokiri, 3.2% of all samples, 4.3% of the instants when one
        thread alone ran; each actor has its own mutexes) */
-    static _Thread_local struct { uint64_t key; Obj *o; } cache[1024];
+    static _Thread_local ObjCacheEntry cache[1024];
+    /* ponytail: a thread's big cache is never freed (up to 256 KB per thread that made nn::os calls); free it at thread exit if
+       threads come and go */
+    static _Thread_local ObjCacheEntry *big;
     static int off = -1;
     if (off < 0) off = getenv("HOS_NO_OBJ_CACHE") != NULL;
     if (!off) {
-        const unsigned i = (unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 54);
-        Obj *o = cache[i].o;
-        if (cache[i].key == key && o && __atomic_load_n(&o->key, __ATOMIC_RELAXED) == key &&
+        const int bits = obj_cache_bits();
+        if (bits && !big) big = (ObjCacheEntry *)calloc((size_t)1 << bits, sizeof *big);
+        ObjCacheEntry *e = bits && big ? &big[(key * 0x9E3779B97F4A7C15ULL) >> (64 - bits)]
+                                       : &cache[(unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 54)];
+        Obj *o = e->o;
+        if (e->key == key && o && __atomic_load_n(&o->key, __ATOMIC_RELAXED) == key &&
             __atomic_load_n(&o->kind, __ATOMIC_ACQUIRE) == kind)
             return o;
         o = obj_lookup(key, kind);
-        cache[i].key = key, cache[i].o = o;
+        e->key = key, e->o = o;
         return o;
     }
     return obj_lookup(key, kind);
@@ -570,12 +593,24 @@ static void event_init(uint64_t key, int signaled, int clear_mode) {
     e->signaled = signaled;
     e->autoclear = clear_mode == 1;   /* EventClearMode_AutoClear = 1, ManualClear = 0 */
 }
+/* (local) HOS_WAKE_ONE=1: a signal wakes only as many sleepers as can go on, not all of them: an auto-clear event one
+   (the first takes the signal, the rest slept again), a semaphore one per count, a message queue one per message (the
+   sleepers on q->cv are all receivers or peekers unless it is full: senders sleep only on a full queue, and every take
+   from a full one still wakes all). A woken peeker, or a receiver that leaves messages behind, passes the wake on.
+   Each needless wake was a context switch and a virtual core given back and taken again (vc_lock) for nothing */
+static int wake_one_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("HOS_WAKE_ONE") && atoi(getenv("HOS_WAKE_ONE")) != 0;
+    return on;
+}
 static void event_signal(Obj *e) {
     AcquireSRWLockExclusive(&e->lk);
     e->signaled = 1;
     if (wake_lat_on()) e->sig_ns = hos_now_ns();
+    const int one = e->autoclear && wake_one_on();
     ReleaseSRWLockExclusive(&e->lk);
-    WakeAllConditionVariable(&e->cv);
+    if (one) WakeConditionVariable(&e->cv);
+    else WakeAllConditionVariable(&e->cv);
     poke_multiwait();
 }
 static void event_clear(Obj *e) {
@@ -847,7 +882,8 @@ static void sema_release(Obj *s, int n) {
     s->sem += n;
     if (s->sem_max && s->sem > s->sem_max) s->sem = s->sem_max;
     ReleaseSRWLockExclusive(&s->lk);
-    WakeAllConditionVariable(&s->cv);
+    if (wake_one_on() && n > 0 && n <= 8) for (int i = 0; i < n; i++) WakeConditionVariable(&s->cv);
+    else WakeAllConditionVariable(&s->cv);
     poke_multiwait();
 }
 HLE(_ZN2nn2os19InitializeSemaphoreEPNS0_13SemaphoreTypeEii) { sema_init(ARG(0), (int)ARG(1), (int)ARG(2)); }
@@ -893,7 +929,8 @@ static int queue_put(Obj *q, uint64_t v, int jam, int try_only) {
     q->qlen++;
     if (wake_lat_on()) q->sig_ns = hos_now_ns();
     ReleaseSRWLockExclusive(&q->lk);
-    WakeAllConditionVariable(&q->cv);
+    if (wake_one_on()) WakeConditionVariable(&q->cv);
+    else WakeAllConditionVariable(&q->cv);
     poke_multiwait();
     return 1;
 }
@@ -912,12 +949,18 @@ static int queue_get(Obj *q, uint64_t *out, int take, int64_t timeout_ns) {
     }
     if (timeout_ns != 0 && wake_lat_on()) wake_lat_note(slept ? 2 : spun ? 1 : 0, slept ? hos_now_ns() - q->sig_ns : 0);
     *out = q->q[q->qhead];
+    const int was_full = q->qlen == q->qcap;
     if (take) {
         q->qhead = (q->qhead + 1) % q->qcap;
         q->qlen--;
     }
+    const int left = q->qlen;
     ReleaseSRWLockExclusive(&q->lk);
-    if (take) {
+    if (wake_one_on()) {
+        if (take && was_full) WakeAllConditionVariable(&q->cv);   /* (senders may sleep: as before) */
+        else if (slept && left) WakeConditionVariable(&q->cv);    /* (the wake passed on: a peeker, or messages left) */
+        if (take) poke_multiwait();
+    } else if (take) {
         WakeAllConditionVariable(&q->cv);
         poke_multiwait();
     }

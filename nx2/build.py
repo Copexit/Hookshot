@@ -641,7 +641,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--jobs", type=int, default=1)
     p.add_argument("--only", default="")
-    p.add_argument("--opt", default="O1")
+    p.add_argument("--opt", default=os.environ.get("RX_COLD_OPT", "O1"))   # (local) RX_COLD_OPT: the lifted game code outside the hot pieces
     p.add_argument("--no-polls", action="store_true")
     p.add_argument("--dll", action="store_true")
     p.add_argument("--lib", action="store_true")
@@ -779,7 +779,11 @@ def main():
             with open(f, "rb") as src:
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
         shader_stamp = "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16]
-        vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
+        # (local) RX_TLSDESC=1: hookshot_vk.so's thread_locals through TLS descriptors (-mtls-dialect=gnu2), not __tls_get_addr
+        # (4% of a replay worker). initial-exec cannot be used: the library is dlopen'd and its TLS is ~178 KB, far past glibc's
+        # static TLS surplus. Needs glibc 2.39 with the BZ 31372 fix or 2.40+ (older _dl_tlsdesc_dynamic clobbers vector registers)
+        tlsdesc = ["-mtls-dialect=gnu2"] if LINUX and os.environ.get("RX_TLSDESC") == "1" else []
+        vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] + tlsdesc if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",
             "-include", "string", "-include", "vector",

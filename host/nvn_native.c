@@ -1277,21 +1277,52 @@ typedef struct { uint64_t magic, bytes, cls; } copy_prefix;   /* (cls: its pool 
 typedef struct { copy_prefix *p; uint64_t after; } dead_copy;
 static dead_copy *dead;
 static size_t ndead, cap_dead;
+static uint64_t dead_min = ~0ull;   /* (the lowest `after` in dead; copy_lock held) */
+/* (local) HOS_NVN_REPLAYED_US=<us>: every AddControlMemory asked the replay how far it got (rx_nvn_replayed: a
+   vkGetSemaphoreCounterValue ioctl and the Vulkan back end's present_mu) while holding copy_lock, the lock every recording
+   thread takes in AddControlMemory and EndRecording: at the lake the ModuleSystemWorkers and MainThread waited ~3 ms a
+   frame summed on it (~0.35 ms on MainThread). With the switch the replay is asked outside the lock, at most once every
+   <us> microseconds (0: every call), and the dead list is only walked when its oldest copy can go. A late answer only
+   frees a copy later (the replay count only grows). Unset: as before */
+static int64_t replayed_us(void) {
+    static int64_t v = -2;
+    if (v == -2) v = getenv("HOS_NVN_REPLAYED_US") ? atoll(getenv("HOS_NVN_REPLAYED_US")) : -1;
+    return v;
+}
+static uint64_t replayed_seen;   /* (the last answer, and when: any thread, relaxed) */
+static int64_t replayed_seen_at;
+static void replayed_refresh(void) {   /* (copy_lock not held) */
+    const int64_t us = replayed_us(), now = us > 0 ? hos_now_ns() : 0;
+    if (us > 0) {
+        int64_t at = __atomic_load_n(&replayed_seen_at, __ATOMIC_RELAXED);
+        if (now - at < us * 1000 || !__atomic_compare_exchange_n(&replayed_seen_at, &at, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return;   /* (asked recently, or another thread asks now) */
+    }
+    const uint64_t d = rx_nvn_replayed();
+    uint64_t old = __atomic_load_n(&replayed_seen, __ATOMIC_RELAXED);
+    while (d > old && !__atomic_compare_exchange_n(&replayed_seen, &old, d, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
 static void free_dead_copies(void) {   /* (copy_lock held) */
-    const uint64_t done = rx_nvn_replayed();
+    const int lazy = replayed_us() >= 0;
+    const uint64_t done = lazy ? __atomic_load_n(&replayed_seen, __ATOMIC_RELAXED) : rx_nvn_replayed();
+    if (lazy && done < dead_min) return;   /* (nothing dead, or not even the oldest can go yet) */
+    uint64_t lo = ~0ull;
     for (size_t i = 0; i < ndead;) {
         if (dead[i].after <= done) {
             InterlockedAdd64(&copy_bytes, -(LONG64)dead[i].p->bytes);
             pool_put(dead[i].p, (unsigned)dead[i].p->cls);
             dead[i] = dead[--ndead];
         } else {
+            if (dead[i].after < lo) lo = dead[i].after;
             i++;
         }
     }
+    dead_min = lo;
 }
 static void release_copies(uint64_t lo, uint64_t hi) {
     if (hi <= lo || !rec_buckets) return;
     const uint64_t after = rx_nvn_pushed() + held_count();   /* (held submits name them too) */
+    if (replayed_us() >= 0) replayed_refresh();
     AcquireSRWLockExclusive(&copy_lock);
     free_dead_copies();
     /* (a range over 4 GiB: every bucket once instead of every block) */
@@ -1314,6 +1345,7 @@ static void release_copies(uint64_t lo, uint64_t hi) {
             dead[ndead].p = p;
             dead[ndead].after = after;
             ndead++;
+            if (after < dead_min) dead_min = after;
             *pn = n->next;
             free(n);
             ncopies--;
@@ -1356,6 +1388,7 @@ static void sweep_overwritten_copies(void) {   /* (copy_lock held) */
             dead[ndead].p = pre;
             dead[ndead].after = after;
             ndead++;
+            if (after < dead_min) dead_min = after;
             *pn = n->next;
             free(n);
             ncopies--;

@@ -689,6 +689,17 @@ int64_t hos_now_ns(void) {
 }
 
 static void sleep_ns(int64_t ns);
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+#include <sys/prctl.h>
+/* (local) HOS_TIMER_SLACK_NS=<ns>: the process's timer slack (Linux: every sleep and timed wait may end up to 50 us late,
+   so the kernel can batch wake-ups), set before any thread is made: they all inherit it. With HOS_SHORT_SLEEP_TIMER=1 a
+   guest sleep under 1 ms is then a real sleep ~10 us late instead of a core yielding (spinning) until the time; at
+   22 W the spinning core's power came out of the GPU's clock. Also tightens HOS_PRESENT_POLL=2's 200 us steps */
+__attribute__((constructor)) static void timer_slack_init(void) {
+    const char *e = getenv("HOS_TIMER_SLACK_NS");
+    if (e && atol(e) > 0) prctl(PR_SET_TIMERSLACK, (unsigned long)atol(e), 0, 0, 0);
+}
+#endif
 /* (virtual cores: a sleep gives the core up, SleepThread(0) offers it to a waiter as good) */
 void hos_sleep_ns(int64_t ns) {
     if (ns <= 0) {
@@ -871,11 +882,13 @@ void hos_sleep_logged(int64_t ns, uint64_t lr) {
    frame noticed the GPU's signal late, ~7 ms of the 25 ms frame asleep on its critical path. The GPU writes the event
    into guest memory itself, so the sleep looks at it between yields (its virtual core given up) and ends once it is
    1, at the latest when the asked time is up. Only where the poll is nvnEventGetValue. HOS_PRESENT_POLL=1 (an
-   experiment: no fps change measured, and it keeps a core busy while it looks) */
+   experiment: no fps change measured, and it keeps a core busy while it looks). (local) HOS_PRESENT_POLL=2: it looks every
+   200 us asleep instead of between yields: the event seen at most 0.2 ms late (the game's own sleeps: ~1.6 ms, ~0.8 late on
+   average) without a core spinning, which on a 22 W laptop took power from the GPU */
 static int present_poll(Ctx *c, int64_t ns) {
     static int on = -1;
     static uint64_t fn_ok, fn_bad;
-    if (on < 0) on = getenv("HOS_PRESENT_POLL") && atoi(getenv("HOS_PRESENT_POLL")) != 0;
+    if (on < 0) on = getenv("HOS_PRESENT_POLL") ? atoi(getenv("HOS_PRESENT_POLL")) : 0;
     if (!on || c->x[30] != 0x80590520 || ns <= 0 || ns > 20000000) return 0;
     const uint64_t fp = G64(c->x[24]);
     if (fp != fn_ok) {
@@ -893,8 +906,17 @@ static int present_poll(Ctx *c, int64_t ns) {
     const int away = hos_vcore_away();
     const int64_t end = hos_now_ns() + ns;
     while (v != 1 && hos_now_ns() < end) {
-        SwitchToThread();
-        for (int i = 0; i < 64; i++) _mm_pause();
+        if (on == 2) {   /* (not hos_sleep_ns: under 1 ms it yields until the time, the spinning this is meant to avoid) */
+#ifdef _WIN32
+            Sleep(1);
+#else
+            const struct timespec ts = {0, 200000};
+            nanosleep(&ts, NULL);
+#endif
+        } else {
+            SwitchToThread();
+            for (int i = 0; i < 64; i++) _mm_pause();
+        }
         hos_nvn_event_value(ev, &v);
     }
     if (away) hos_vcore_back();
