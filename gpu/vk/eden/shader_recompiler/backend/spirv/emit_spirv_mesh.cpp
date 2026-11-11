@@ -131,6 +131,22 @@ u32 FallbackRecordWords(const MeshInfo& mesh) {
            static_cast<u32>(mesh.primitive_lines.size());
 }
 
+/// (local) RX_VK_MESH_COMPACT=1: the mesh workgroups pack their records from 0 (an atomic add on the records buffer's word
+/// 0, which is also the vertex count of the indirect draw the host makes from words 0-3), so a slot that drew less, or
+/// nothing, costs the graphics draw nothing. The host reads the same switch (vk_draw.cpp fallback_record); the switch is
+/// under RX_VK_MESH, so the program cache keys on it. Primitives of different workgroups land in the order the workgroups
+/// finish, not by workgroup index.
+bool FallbackCompact() {
+    static const bool on{std::getenv("RX_VK_MESH_COMPACT") != nullptr};
+    return on;
+}
+
+/// (local) RX_VK_MESH_EARLYOUT=1: see EmitMeshFallbackVertexBody. Without RX_VK_MESH_COMPACT only (with it no vertex is dead).
+bool FallbackEarlyOut() {
+    static const bool on{std::getenv("RX_VK_MESH_EARLYOUT") != nullptr};
+    return on;
+}
+
 Id PushU64(EmitContext& ctx, u32 member) {
     const Id pointer_type{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U64)};
     return ctx.OpLoad(
@@ -205,9 +221,27 @@ void MeshFallbackEpilogue(EmitContext& ctx) {
             count = ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, started, ctx.u32_zero_value),
                                  ctx.u32_zero_value, count);
         }
-        If(ctx, ctx.OpIEqual(ctx.U1, LocalInvocation(ctx), ctx.u32_zero_value), [&] {
-            StoreWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index, slot), count);
-        });
+        // The first record of this workgroup: slot * per_slot, or (compact) where the atomic add placed it
+        Id base{ctx.OpIMul(ctx.U32[1], slot, ctx.Const(per_slot))};
+        if (FallbackCompact()) {
+            // (local) Every invocation has read the count above before invocation 0 reuses its workgroup word for the base
+            // (the barriers are in uniform control flow: slot is the workgroup's). The slot counts are not written: word 0
+            // is the draw's vertex count now
+            Barrier(ctx);
+            If(ctx, ctx.OpIEqual(ctx.U1, LocalInvocation(ctx), ctx.u32_zero_value), [&] {
+                const Id first{ctx.OpAtomicIAdd(
+                    ctx.U32[1], BufferWord(ctx, ctx.mesh_fallback_records_member_index, ctx.u32_zero_value),
+                    ctx.Const(static_cast<u32>(spv::Scope::Device)), ctx.u32_zero_value,
+                    ctx.OpIMul(ctx.U32[1], count, ctx.Const(corners)))};
+                ctx.OpStore(ctx.mesh_primitive_count, first);
+            });
+            Barrier(ctx);
+            base = ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count);
+        } else {
+            If(ctx, ctx.OpIEqual(ctx.U1, LocalInvocation(ctx), ctx.u32_zero_value), [&] {
+                StoreWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index, slot), count);
+            });
+        }
         const Id invocation{LocalInvocation(ctx)};
         Strided(ctx, mesh.max_primitives, ctx.mesh_threads, invocation, [&](Id primitive) {
             If(ctx, ctx.OpULessThan(ctx.U1, primitive, count), [&] {
@@ -220,7 +254,7 @@ void MeshFallbackEpilogue(EmitContext& ctx) {
                         ctx, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, byte)),
                         mesh.max_vertices)};
                     const Id record{ctx.OpIAdd(
-                        ctx.U32[1], ctx.OpIMul(ctx.U32[1], slot, ctx.Const(per_slot)),
+                        ctx.U32[1], base,
                         ctx.OpIAdd(ctx.U32[1],
                                    ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(corners)),
                                    ctx.Const(corner)))};
@@ -424,6 +458,55 @@ void EmitMeshFallbackVertexBody(EmitContext& ctx) {
     const u32 words{FallbackRecordWords(mesh)};
     const u32 per_slot{mesh.max_primitives * corners};
     const Id vertex{ctx.OpLoad(ctx.U32[1], ctx.vertex_index)};
+    const auto clip_out = [&] {
+        StorePosition(ctx, 0, ctx.f32_zero_value);
+        StorePosition(ctx, 1, ctx.f32_zero_value);
+        StorePosition(ctx, 2, ctx.f32_zero_value);
+        StorePosition(ctx, 3, ctx.Const(-1.0f));
+    };
+    // The record's words: its vertex lines (the position held back for the depth conversion), then its primitive lines.
+    const auto emit_record = [&](Id first) {
+        const auto read = [&](u32 word) {
+            return ctx.OpBitcast(
+                ctx.F32[1],
+                LoadWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index,
+                                         ctx.OpIAdd(ctx.U32[1], first, ctx.Const(word)))));
+        };
+        std::array<Id, 4> position{};
+        for (u32 line = 0; line < vertex_lines; ++line) {
+            const IR::Attribute attribute{mesh.vertex_lines[line]};
+            const Id value{read(1U + line)};
+            const u32 raw{static_cast<u32>(attribute)};
+            if (raw >= static_cast<u32>(IR::Attribute::PositionX) &&
+                raw <= static_cast<u32>(IR::Attribute::PositionW)) {
+                position[raw - static_cast<u32>(IR::Attribute::PositionX)] = value;
+            } else {
+                StoreFallbackOutput(ctx, attribute, value);
+            }
+        }
+        for (u32 line = 0; line < primitive_lines; ++line) {
+            StoreFallbackOutput(ctx, IR::Attribute{mesh.primitive_lines[line]},
+                                read(1U + vertex_lines + line));
+        }
+        // (OpenGL-style clip space, as the mesh epilogue's ConvertDepth)
+        if (ctx.runtime_info.convert_depth_mode && !ctx.profile.support_native_ndc &&
+            Sirit::ValidId(position[2]) && Sirit::ValidId(position[3])) {
+            position[2] = ctx.OpFMul(ctx.F32[1], ctx.OpFAdd(ctx.F32[1], position[2], position[3]),
+                                     ctx.Const(0.5f));
+        }
+        for (u32 element = 0; element < 4; ++element) {
+            if (Sirit::ValidId(position[element])) {
+                StorePosition(ctx, element, position[element]);
+            }
+        }
+    };
+    if (FallbackCompact()) {
+        // (local) RX_VK_MESH_COMPACT=1: the records are packed from 0 and the draw covers only those written (an indirect
+        // draw whose vertex count the mesh workgroups added up): every vertex is a live one, no count or validity to test
+        emit_record(ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
+                               ctx.OpIMul(ctx.U32[1], vertex, ctx.Const(words))));
+        return;
+    }
     const Id slot{ctx.OpUDiv(ctx.U32[1], vertex, ctx.Const(per_slot))};
     const Id within{ctx.OpUMod(ctx.U32[1], vertex, ctx.Const(per_slot))};
     const Id primitive{ctx.OpUDiv(ctx.U32[1], within, ctx.Const(corners))};
@@ -438,50 +521,25 @@ void EmitMeshFallbackVertexBody(EmitContext& ctx) {
                                                                            ctx.Const(corners)),
                                                                 corner)),
                                           ctx.Const(words)))};
-    const Id first{record};
-    const Id valid{LoadWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index, first))};
-    const auto read = [&](u32 word) {
-        return ctx.OpBitcast(
-            ctx.F32[1],
-            LoadWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index,
-                                     ctx.OpIAdd(ctx.U32[1], first, ctx.Const(word)))));
+    const Id dead_primitive{ctx.OpUGreaterThanEqual(ctx.U1, primitive, count)};
+    // (a record no mesh workgroup wrote: outside the clip volume)
+    const auto live_record = [&] {
+        const Id valid{LoadWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index, record))};
+        emit_record(record);
+        If(ctx, ctx.OpIEqual(ctx.U1, valid, ctx.u32_zero_value), clip_out);
     };
-    std::array<Id, 4> position{};
-    for (u32 line = 0; line < vertex_lines; ++line) {
-        const IR::Attribute attribute{mesh.vertex_lines[line]};
-        const Id value{read(1U + line)};
-        const u32 raw{static_cast<u32>(attribute)};
-        if (raw >= static_cast<u32>(IR::Attribute::PositionX) &&
-            raw <= static_cast<u32>(IR::Attribute::PositionW)) {
-            position[raw - static_cast<u32>(IR::Attribute::PositionX)] = value;
-        } else {
-            StoreFallbackOutput(ctx, attribute, value);
-        }
-    }
-    for (u32 line = 0; line < primitive_lines; ++line) {
-        StoreFallbackOutput(ctx, IR::Attribute{mesh.primitive_lines[line]},
-                            read(1U + vertex_lines + line));
-    }
-    // (OpenGL-style clip space, as the mesh epilogue's ConvertDepth)
-    if (ctx.runtime_info.convert_depth_mode && !ctx.profile.support_native_ndc &&
-        Sirit::ValidId(position[2]) && Sirit::ValidId(position[3])) {
-        position[2] = ctx.OpFMul(ctx.F32[1], ctx.OpFAdd(ctx.F32[1], position[2], position[3]),
-                                 ctx.Const(0.5f));
-    }
-    for (u32 element = 0; element < 4; ++element) {
-        if (Sirit::ValidId(position[element])) {
-            StorePosition(ctx, element, position[element]);
-        }
+    if (FallbackEarlyOut()) {
+        // (local) RX_VK_MESH_EARLYOUT=1: a vertex past its workgroup's primitive count (most of them: the draw covers every
+        // slot's most primitives) loads nothing more and writes only the clip-out position; before, it loaded its whole
+        // record first. Every corner of a primitive takes the same side, so a primitive is drawn whole or not at all
+        If(ctx, ctx.OpLogicalNot(ctx.U1, dead_primitive), live_record);
+        If(ctx, dead_primitive, clip_out);
+        return;
     }
     // (a record past the workgroup's primitive count, or one no mesh workgroup wrote: outside the clip volume)
-    If(ctx, ctx.OpLogicalOr(ctx.U1, ctx.OpUGreaterThanEqual(ctx.U1, primitive, count),
-                            ctx.OpIEqual(ctx.U1, valid, ctx.u32_zero_value)),
-       [&] {
-           StorePosition(ctx, 0, ctx.f32_zero_value);
-           StorePosition(ctx, 1, ctx.f32_zero_value);
-           StorePosition(ctx, 2, ctx.f32_zero_value);
-           StorePosition(ctx, 3, ctx.Const(-1.0f));
-       });
+    const Id valid{LoadWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index, record))};
+    emit_record(record);
+    If(ctx, ctx.OpLogicalOr(ctx.U1, dead_primitive, ctx.OpIEqual(ctx.U1, valid, ctx.u32_zero_value)), clip_out);
 }
 
 Id EmitIsbeRead(EmitContext& ctx, Id address) {

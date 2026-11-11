@@ -1032,7 +1032,9 @@ uint64_t disk_stamp() {
     }
     for (char** e = _environ; e && *e; e++)
         for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "RX_VK_NO_INVARIANT", "RX_VK_NO_NAN_GUARD", "RX_VK_MARKERS", "EDEN_"})
-            if (!strncmp(*e, pre, strlen(pre))) add(*e, strlen(*e));
+            // (local) host-side mesh switches change no shader: left out, so turning them on/off does not prepare every shader again
+            if (!strncmp(*e, pre, strlen(pre)) && strncmp(*e, "RX_VK_MESH_NO_SHADOW", 20) && strncmp(*e, "RX_VK_MESH_FILL_USED", 20))
+                add(*e, strlen(*e));
     return h;
 }
 
