@@ -1310,6 +1310,42 @@ bool MixesLoadedPointer(const IR::Value& value) {
 
 thread_local bool g_follow_stage = false;   // (hookshot: the program being translated is compute, where the page table is)
 thread_local bool g_graphics_stage = false;   // (sharkiix: the program being translated is a geometry stage: vertex, tessellation, geometry, task, mesh)
+thread_local bool g_fragment_stage = false;   // (local, RX_VK_OOT_GM_BASE: the program being translated is a fragment stage)
+
+/// (local) RX_VK_OOT_GM_BASE=1, off unless set: a fragment program's load whose low address is a constant buffer pointer word
+/// plus an offset, and whose split (see Origins) is in that offset only, is bound to that pointer's buffer like an unsplit
+/// access. OoT's forward-lit materials (~3/4 of the fragment programs with a global
+/// access) read each clustered light's 96-byte record at c0+0x520 + index * 96, the index a phi of constant buffer words and
+/// values read from memory: split, so every record read went to the run-time search (the bound buffers' range tests and the
+/// page table, inlined at each of the 5 reads in the light loop). #410's split is the pointer's own (c0[x] or *c0[x]); here
+/// the pointer is the constant buffer word itself, the buffer the search finds (its range test is the same binding). The lake
+/// water program reads the same records through the same slot tracked this way. A record outside the binding now
+/// reads 0 (the search went on to the other buffers and the page table). Under RX_VK_OOT, so the program cache starts again
+/// when it changes
+bool OotGmBase() {
+    static const bool on = std::getenv("RX_VK_OOT_GM_BASE") && std::atoi(std::getenv("RX_VK_OOT_GM_BASE")) != 0;
+    return on;
+}
+bool SplitInOffsetOnly(const IR::U32& low_addr, const StorageBufferAddr& buffer) {
+    if (low_addr.IsImmediate()) {
+        return false;
+    }
+    const IR::Inst* const add{low_addr.InstRecursive()};
+    if (add->GetOpcode() != IR::Opcode::IAdd32) {
+        return false;
+    }
+    for (size_t side = 0; side < 2; ++side) {
+        const IR::Value base{add->Arg(side)};
+        if (base.IsImmediate()) {
+            continue;
+        }
+        const std::optional<StorageBufferAddr> word{CbufWord(base.InstRecursive())};
+        if (word && word->index == buffer.index && word->offset == buffer.offset) {
+            return true;   // (the low word of the very pointer the access was tracked to, added in directly)
+        }
+    }
+    return false;
+}
 
 /// Collects the storage buffer used by a global memory instruction and the instruction itself
 void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, Environment& env,
@@ -1500,7 +1536,9 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
             return;
         }
     }
-    if (split_fallback && origins.split) {
+    const bool split_offset_only{split_fallback && origins.split && OotGmBase() && g_fragment_stage &&
+                                 !IsGlobalMemoryWrite(inst) && SplitInOffsetOnly(low_addr, *storage_buffer)};
+    if (split_fallback && origins.split && !split_offset_only) {
         // (Lichii #410, Duck912, adapted) The tracked pointer is one side of a select or phi whose other side is a pointer
         // loaded from memory: bound too, so that the run-time search finds the accesses through it in every stage (the
         // loaded side's are the page table's, where the stage has one). OoT's near-leaf pass reads its placement records
@@ -1662,6 +1700,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     g_follow_stage = program.stage == Stage::Compute || (!no_mesh && (program.stage == Stage::Task || program.stage == Stage::Mesh));
     // (geometry stages only: with the fragment stage too, the sky drew black rectangles and the lighting went too bright at the castle)
     g_graphics_stage = program.stage != Stage::Compute && program.stage != Stage::Fragment;
+    g_fragment_stage = program.stage == Stage::Fragment;
     g_origins.clear();   // (EvilOOT: Origins' walk, kept per program)
     const bool pairing{!GmLegacyFor(program.stage)};
     std::optional<TrackingConditions> conditions;
