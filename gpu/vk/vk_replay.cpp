@@ -2992,6 +2992,36 @@ void do_present(const nvn_tex* t, const int crop[4]) {
                 logf("vk: present %lld written to %s", (long long)at_present, path.c_str());
             }).detach();
         };
+        {   // (local) RX_VK_FRAME_WAIT (on unless =0): a present waits for the GPU to finish the one before it, as a shot of every
+            // frame did. The game's CPU otherwise ran further ahead and rewrote what the GPU had yet to read: draws of a frame
+            // black or missing (a quarter of the frames' hearts in Hyrule Field on RADV RENOIR, 2% with this), lighting flashing.
+            // (RX_VK_FRAME_WAIT=<n>: for the present n back, default 1; 0: none. 2 lets the CPU record a frame while the GPU
+            // draws the one before: at 42% the GPU took 26 ms and the CPU's part ~15, one after the other with 1)
+            // (=-1: this present's own work waited for: the CPU never ahead of the GPU at all, a test of how much the rest is that)
+            static const int depth_raw = getenv("RX_VK_FRAME_WAIT") ? atoi(getenv("RX_VK_FRAME_WAIT")) : 1;
+            if (depth_raw < 0) wait_value(value);
+            static const int depth = std::clamp(depth_raw, 0, 7);
+            static uint64_t past_values[8]{};
+            static uint64_t n_presents_seen = 0;
+            if (depth && n_presents_seen >= (uint64_t)depth) {
+                const uint64_t v = past_values[(n_presents_seen - depth) & 7];
+                if (frame_wait_unlocked() && !async_on()) frame_wait_after = v;   // (present() waits, its locks let go)
+                else frame_wait_timed(v);
+            }
+            past_values[n_presents_seen++ & 7] = value;
+            // (local) RX_VK_PRESENT_FPS=<fps>: presents at least 1/fps apart. The game hands frames over in pairs (15 ms and
+            // 45 ms by turns at ~30 fps on a Vega 8), the judder; held to an even 33 ms they are smooth. Game time follows the
+            // clock (Real time), so the motion stays right
+            static const double min_gap = getenv("RX_VK_PRESENT_FPS") && atof(getenv("RX_VK_PRESENT_FPS")) > 0
+                                              ? 1e9 / atof(getenv("RX_VK_PRESENT_FPS")) : 0;
+            static auto last_present = std::chrono::steady_clock::now();
+            if (min_gap > 0) {
+                const auto due = last_present + std::chrono::nanoseconds((int64_t)min_gap);
+                const auto now = std::chrono::steady_clock::now();
+                if (now < due) std::this_thread::sleep_until(due);
+                last_present = std::max(due, now);   // (late: from now, no catching up in a burst)
+            }
+        }
         if (pending.on && (shot || completed() >= pending.value)) take(pending.value, pending.presents), pending.on = false;
         if (shot && made_src && made_map) {
             take(value, presents);

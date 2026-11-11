@@ -247,6 +247,19 @@ static void realtime_step(int64_t now) {
                     *(uint8_t *)GP(mod + 0x232), *(int *)GP(mod + 0x2c8), *(int *)GP(mod + 0x270 + 0x58), *(int *)GP(mod + 0x270 + 0x28),
                     *(int *)GP(mod + 0x270 + 0x2c), *(int *)GP(mod + 0x270 + 0x30));
         if (target && *limit > 0 && *limit < target) *limit = target;
+        /* (local) HOS_FPS_CAP=<fps>: the limiter held at that rate or under: frames evenly that far apart where the PC
+           cannot keep 60 (a laptop's Vega 8 at 22-35: 15 ms and 45 ms frames by turns, the judder, against an even 33) */
+        static int cap = -1;
+        if (cap < 0) cap = getenv("HOS_FPS_CAP") ? atoi(getenv("HOS_FPS_CAP")) : 0;
+        if (cap > 0 && (*limit <= 0 || *limit > cap)) *limit = cap;
+    }
+    {   /* (local) HOS_GAME_FPS=<15-60>: the game's frame rate held there, every frame: its step one fixed 1/fps. Real time
+           moved it frame by frame (15 to 60, from the last frames' times), and frames where it changed drew the lit scene
+           black. 30 for a PC paced to 30 (RX_VK_PRESENT_FPS=30): real speed with a step that never changes */
+        static int pin = -1;
+        if (pin < 0) pin = getenv("HOS_GAME_FPS") ? atoi(getenv("HOS_GAME_FPS")) : 0;
+        int *slot = (int *)GP(mod + 0x2c8);
+        if (pin >= 15 && pin <= 60 && *slot >= 15 && *slot <= 60) { *slot = pin; return; }
     }
     if (!rx_option(0, 1)) {   /* (the Insert menu: per frame) */
         int *slot = (int *)GP(mod + 0x2c8);
