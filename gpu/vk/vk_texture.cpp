@@ -574,7 +574,7 @@ void bc_encode_into(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t n, Tex
     wr[1].pBufferInfo = &bi;
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bc_layout, 0, 2, wr);
     descriptors_disturbed();
-    const BcPush pc{(w + 3) / 4, (h + 3) / 4, w, h, 1, 0};
+    const BcPush pc{(w + 3) / 4, (h + 3) / 4, w, h, dst.format != VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 0};   // (BC1: RX_VK_ASTC_BC1)
     vkCmdPushConstants(cmd, bc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
     vkCmdDispatch(cmd, (pc.blocks_x + 7) / 8, (pc.blocks_y + 7) / 8, n);
     full_barrier(cmd);
@@ -1661,6 +1661,42 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             x.bc = true;
             x.format = VK_FORMAT_BC3_UNORM_BLOCK;
         }
+        // (local) RX_VK_ASTC_BC1=1: one whose ASTC blocks carry no alpha (astc_bc_policy::alpha_free) as BC1 instead: BC3's colour
+        // half, the same texels in half the bytes and half the texture reads. The format is chosen here, at its first upload's data;
+        // a later upload with alpha would get BC1's 1-bit alpha (the encoder's punch-through). =1: only those whose block grids
+        // halve evenly down the chain (a native BC1 texture's uneven tail levels stalled RADV RENOIR for good: RX_VK_BC_TRIM below;
+        // BC3 ones with uneven levels run here); =2: the uneven ones too (Ocarina's terrain material arrays, 682 x 682 x 90)
+        static const int bc1 = getenv("RX_VK_ASTC_BC1") ? atoi(getenv("RX_VK_ASTC_BC1")) : 0;
+        if (bc1 && x.bc && (bc1 >= 2 || bc_levels::first_uneven(x.width, x.height, x.levels) >= x.levels)) {
+            std::vector<uint8_t> scratch;   // (only if the storage is not one piece, or the capture holds it)
+            static std::atomic<uint64_t> n_bc1, n_bc3, mb_bc1, mb_bc3;   // (texels; for the log)
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool opaque = astc_bc_policy::alpha_free(guest_bytes(t->gpu, t->L.size, scratch), t->L.size, bw, bh);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            uint64_t epx = 0;
+            for (uint32_t l = 0; l < x.levels; l++) epx += (uint64_t)std::max(1u, x.width >> l) * std::max(1u, x.height >> l);
+            (opaque ? n_bc1 : n_bc3)++, (opaque ? mb_bc1 : mb_bc3) += epx * x.layers;
+            if (opaque) x.format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+            const uint64_t n = n_bc1 + n_bc3;
+            if (n <= 8 || (n & (n - 1)) == 0 || ms > 4)
+                logf("vk: ASTC %ux%u x%u (%ux%u blocks) as %s, checked in %.1f ms; so far BC1 %llu (%llu MB), BC3 %llu (%llu MB)",
+                     x.width, x.height, x.layers, bw, bh, opaque ? "BC1" : "BC3", ms, (unsigned long long)n_bc1,
+                     (unsigned long long)(mb_bc1 >> 21), (unsigned long long)n_bc3, (unsigned long long)(mb_bc3 >> 20));
+        }
+    }
+    // (local) RX_VK_BC_TRIM (on unless =0): a native BC texture keeps only the levels whose block grids halve evenly. On RADV
+    // RENOIR (GFX9) the copy of a 1500x736 BC1 texture's tail levels (5-10) stalled the GPU for good at Ocarina's first scene
+    // (markers: the second copy of that upload never finished, no page fault); the ASTC rule above does the same for AMD
+    if (!astc && is_bc(x.format) && x.type == VK_IMAGE_TYPE_2D && !x.sparse && x.levels > 1) {
+        static const bool trim = !(getenv("RX_VK_BC_TRIM") && getenv("RX_VK_BC_TRIM")[0] == '0');
+        const uint32_t el = trim ? bc_levels::first_uneven(x.width, x.height, x.levels) : x.levels;
+        if (el < x.levels) {
+            static int n;
+            if (++n <= 4 || (n & (n - 1)) == 0)
+                logf("vk: texture %#llx %ux%u, %u levels: native BC, %u levels kept (uneven block grids; %d so far)",
+                     (unsigned long long)t->gpu, x.width, x.height, x.levels, el, n);
+            x.levels = el;
+        }
     }
     const VkFormatProperties fp = format_props(x.format);
     x.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -1753,6 +1789,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         px += (uint64_t)std::max(1u, x.width >> l) * std::max(1u, x.height >> l) * std::max(1u, x.depth >> l);
     const uint32_t texel = x.bc || is_bc(x.format) ? 1 : astc ? 4 : std::max(1, from ? (from == 3 ? 4 : from == 6 ? 8 : 16) : bpb);
     x.bytes = x.sparse ? 0 : px * x.layers * texel * x.samples;   // (a sparse image's: as its layers are bound)
+    if (x.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK && x.bc) x.bytes /= 2;   // (RX_VK_ASTC_BC1: half a byte a texel)
     // (the budget counts what the allocator gave it: the texels' 8% short of that over a scene's 2000 textures, 3228 MB counted for 3504
     // MB held, and a budget of 4035 MB took 4300. RX_VK_COUNT_BY_ESTIMATE=1: the texels)
     static const bool by_estimate = getenv("RX_VK_COUNT_BY_ESTIMATE") != nullptr;
@@ -2300,7 +2337,9 @@ VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkIm
     if (tex->astc) f = (nf >= 0x87 && nf <= 0x94) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     if (tex->bc) {
         if (use != ViewUse::Sample) return VK_NULL_HANDLE;
-        f = f == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+        const bool srgb = f == VK_FORMAT_R8G8B8A8_SRGB;
+        f = tex->format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ? (srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK)
+                                                          : (srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK);
     }
     if (use == ViewUse::Storage) f = force_format != VK_FORMAT_UNDEFINED ? force_format : storage_view_format(f);
     if (use == ViewUse::Attachment && is_astc(f)) return VK_NULL_HANDLE;
@@ -3247,7 +3286,7 @@ void texture_frame(uint64_t completed) {
              (unsigned long long)(block_free >> 20), (unsigned long long)(total_bytes >> 20),
              (unsigned long long)(budget >> 20), textures.size());
         // (what takes it: decoded ASTC, the GPU's images, the rest; the largest)
-        uint64_t astc_b = 0, rt_b = 0, other_b = 0, recent_b = 0, baked_b = 0;
+        uint64_t astc_b = 0, astc_bc_b = 0, astc_recent_b = 0, rt_b = 0, other_b = 0, recent_b = 0, baked_b = 0;
         size_t baked_n = 0;
         std::vector<const Texture*> big, baked;
         size_t bucket_n[4]{}, bucket_rel[4]{};
@@ -3255,7 +3294,8 @@ void texture_frame(uint64_t completed) {
         for (auto& kv : textures) {
             const Texture* t = kv.second.get();
             (t->astc ? astc_b : t->gpu_written ? rt_b : other_b) += t->bytes;
-            if (frame_no - t->last_frame < 8) recent_b += t->bytes;
+            if (frame_no - t->last_frame < 8) recent_b += t->bytes, astc_recent_b += t->astc ? t->bytes : 0;
+            if (t->bc) astc_bc_b += t->bytes;
             if (t->gpu_written && t->first_written && t->first_written == t->last_written && t->bytes <= (4ull << 20)) {
                 if (!t->released) baked_n++, baked_b += t->bytes;
                 const int k = t->bytes <= (64u << 10) ? 0 : t->bytes <= (256u << 10) ? 1 : t->bytes <= (1u << 20) ? 2 : 3;
@@ -3281,10 +3321,11 @@ void texture_frame(uint64_t completed) {
             }
         }
         std::sort(big.begin(), big.end(), [](const Texture* a, const Texture* b) { return a->bytes > b->bytes; });
-        logf("vk: textures: decoded ASTC %llu MB, rendered %llu MB (%zu drawn in one frame, kept: %llu KB), other %llu MB; "
-             "used in the last 8 presents %llu MB", (unsigned long long)(astc_b >> 20), (unsigned long long)(rt_b >> 20),
+        logf("vk: textures: decoded ASTC %llu MB (%llu MB of it as BC1/BC3), rendered %llu MB (%zu drawn in one frame, kept: %llu KB), "
+             "other %llu MB; used in the last 8 presents %llu MB (%llu MB decoded ASTC)", (unsigned long long)(astc_b >> 20),
+             (unsigned long long)(astc_bc_b >> 20), (unsigned long long)(rt_b >> 20),
              baked_n, (unsigned long long)(baked_b >> 10), (unsigned long long)(other_b >> 20),
-             (unsigned long long)(recent_b >> 20));
+             (unsigned long long)(recent_b >> 20), (unsigned long long)(astc_recent_b >> 20));
         for (size_t i = 0; i < big.size() && i < 8; i++)
             logf("vk:   %llu MB: %#llx %ux%ux%u x%u levels %u NVN %#x%s%s, last used %llu presents ago",
                  (unsigned long long)(big[i]->bytes >> 20), (unsigned long long)big[i]->gpu, big[i]->width, big[i]->height,
