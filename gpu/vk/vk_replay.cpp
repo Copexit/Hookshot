@@ -98,7 +98,10 @@ struct Recording {
     VkFence fence = VK_NULL_HANDLE;
     bool submitted = false;
     uint64_t batch = 0;   // (RX_VK_BATCH: the batch it went out in, waited for on batch_tl; 0: its own fence)
+    std::vector<VkCommandBuffer> extra_uploads;   // (local: upload command buffers sent ahead, upload_split)
+    size_t extra_used = 0;
 };
+Recording* cur_recording = nullptr;   // (local: the one begin_recording began, for upload_split)
 // (24: the event waits cut a frame's command buffers into pieces, each with recordings of its own, and with 16 the
 // replay waited ~1.5 ms a frame for a slot the GPU still had)
 constexpr int kRecordings = 48;   // (test: 24 before; with RX_VK_BATCH the ring came round to held submits once a frame)
@@ -327,7 +330,14 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         nsig++;
         std::lock_guard mk(rec_map_mu);
         for (uint64_t v : rec_open_values) value_rec.emplace(v, seq);
-        if (r.value) value_rec.emplace(r.value, seq);
+        // (local) only the part that signals the submission's value stands for it: a long submission goes in parts
+        // (maybe_split, every RX_VK_CHUNK draws; the parallel replay's part before its segments), each with r.value, and
+        // emplace kept the FIRST part's number, so a wait for the game's fence (wait_recorded) returned once the first 120
+        // draws had run, and the game rewrote its frame's data under the passes still to come (the lit scene black for a
+        // frame, RADV RENOIR). RX_VK_FENCE_FIRST_PART=1: as before
+        static const bool first_part = getenv("RX_VK_FENCE_FIRST_PART") != nullptr;
+        if (r.value && first_part) value_rec.emplace(r.value, seq);
+        else if (r.value && signal_value) value_rec.insert_or_assign(r.value, seq);
         rec_open_values.clear();
         while (value_rec.size() > 8192) value_rec.erase(value_rec.begin());
     }
@@ -353,6 +363,45 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: submit %llu failed (%d)", (unsigned long long)r.value, (int)res);
     if (res == VK_ERROR_DEVICE_LOST) checkpoints_report();
 }
+
+// (local) The uploads recorded so far sent to the GPU now, in a submit of their own, and a new upload command buffer begun for
+// the rest: a scene's load decoded hundreds of ASTC textures on the GPU in one upload command buffer, and one submission
+// past the kernel's 10 s took the GPU down (RADV RENOIR, Link's house and Hyrule Field loads). Queue order keeps them ahead
+// of the recording's own commands. Called by vk_texture.cpp past its work budget.
+}  // namespace (local: upload_split is vk_texture.cpp's too)
+VkCommandBuffer upload_split(VkCommandBuffer old) {
+    Recording* r = cur_recording;
+    if (!r || !old) return old;
+    vkEndCommandBuffer(old);
+    {
+        std::lock_guard lk(dev.present_mu);
+        VkCommandBufferSubmitInfo cb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+        cb.commandBuffer = old;
+        if (batch_on()) {
+            pend.cbs.push_back(cb);   // (after the held ones: their order)
+            flush_reason = FR_OTHER, queue_flush_locked();
+        } else {
+            VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+            si.commandBufferInfoCount = 1, si.pCommandBufferInfos = &cb;
+            vkQueueSubmit2(dev.queue, 1, &si, VK_NULL_HANDLE);
+        }
+    }
+    if (r->extra_used == r->extra_uploads.size()) {
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = r->upload_pool, ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, ai.commandBufferCount = 1;
+        VkCommandBuffer c = VK_NULL_HANDLE;
+        if (vkAllocateCommandBuffers(dev.device, &ai, &c) != VK_SUCCESS) return VK_NULL_HANDLE;
+        r->extra_uploads.push_back(c);
+    }
+    const VkCommandBuffer next = r->extra_uploads[r->extra_used++];
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(next, &bi);
+    static int told;
+    if (told++ < 20) logf("vk: uploads sent ahead in a submit of their own (%zu this recording)", r->extra_used);
+    return next;
+}
+namespace {
 
 // ---- NVN state (the draw path's, vk_state.h) ----
 NvnState state;

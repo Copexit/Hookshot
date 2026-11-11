@@ -522,10 +522,13 @@ Shader::Profile make_profile() {
     p.support_scaled_attributes = false;   // (*_UI2F / *_I2F read as integers, converted in the shader: R32 has no scaled format)
     p.support_multi_viewport = true;
     p.support_sampled_image_array_nonuniform_indexing = true;
-    p.warp_size_potentially_larger_than_guest = false;
+    // (local) a GPU that cannot pin 32 lanes (GFX9: 64 only): the translator emulates NVN's 32-lane warps in the wider subgroups
+    // (lane ids, shuffles and votes masked to 32). Off, OoT's lighting network drew tiled stripes on RADV RENOIR; RX_VK_WARP64=0: off
+    p.warp_size_potentially_larger_than_guest = dev.subgroup_size > 32 && dev.sg32_stages == 0 &&
+                                                !(getenv("RX_VK_WARP64") && getenv("RX_VK_WARP64")[0] == '0');
     p.lower_left_origin_mode = false;
     p.need_declared_frag_colors = false;
-    p.max_subgroup_size = 32;
+    p.max_subgroup_size = p.warp_size_potentially_larger_than_guest ? dev.subgroup_size : 32;
     p.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
     return p;
 }

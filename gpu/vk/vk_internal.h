@@ -61,6 +61,7 @@ struct Device {
     VkPhysicalDeviceVulkan12Features vk12{};
     VkPhysicalDeviceVulkan13Features vk13{};
     VkShaderStageFlags sg32_stages = 0;   // (stages that run at 32 lanes when asked: the size the translated programs assume)
+    uint32_t subgroup_size = 32;   // (local) the default lanes of a subgroup (64 on GFX9, which cannot run 32)
     uint32_t max_push_descriptors = 0;
     // no window (HOS_HEADLESS): presents go to an image of their own, which RX_VK_SHOTS can write out
     bool offscreen = false;
@@ -120,6 +121,9 @@ void coopmat_init();   // vk_coopmat.cpp (once the device is made)
 /// A marker of another kind of GPU work (m: mirror sync, b: write-back, u: texture upload, g: GPU unswizzle; key: its
 /// pool or texture), RX_VK_CHECKPOINTS
 void checkpoint_mark(VkCommandBuffer cmd, uint64_t key, char kind);
+void watch_note(const char* fmt, ...);   // (a line for the device-lost report's ring)
+VkCommandBuffer upload_split(VkCommandBuffer old);   // (local, vk_replay.cpp: uploads so far sent ahead, a new one begun)
+VkCommandBuffer texture_upload_cmd_current();         // (local, vk_texture.cpp: the upload command buffer being recorded)
 
 /// Parallel replay (vk_replay.cpp, RX_VK_PARALLEL): while segments of a submission are recorded on several threads,
 /// what they share (textures and their uploads, programs, pipelines, samplers, pools and memory stamps) is used under

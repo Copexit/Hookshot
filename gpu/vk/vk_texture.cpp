@@ -224,6 +224,20 @@ thread_local uint64_t tl_seg = 0;
 uint32_t epoch = 0;
 int64_t st_uploads, st_astc, st_bytes;
 
+thread_local uint64_t up_work = 0;   // (local: decode work in up_cmd, texels)
+}  // namespace (local: texture_upload_cmd_current is vk_replay.cpp's too)
+VkCommandBuffer texture_upload_cmd_current() { return up_cmd; }
+namespace {
+// (local) RX_VK_UPLOAD_SPLIT_MTEXELS=<n> (default 4, 0: off): past that much GPU decoding in one upload command buffer, the
+// uploads so far go to the GPU in a submit of their own (upload_split), so no one submission outlasts the kernel's timeout
+void upload_work(uint64_t texels) {
+    static const uint64_t budget = (uint64_t)(getenv("RX_VK_UPLOAD_SPLIT_MTEXELS") ? atof(getenv("RX_VK_UPLOAD_SPLIT_MTEXELS")) : 4.0) * 1000000ull;
+    if (budget && up_used && up_work + texels > budget && !par_active.load(std::memory_order_relaxed)) {
+        full_barrier(up_cmd);
+        if (const VkCommandBuffer next = upload_split(up_cmd)) up_cmd = next, up_used = false, up_work = 0;
+    }
+    up_work += texels;
+}
 VkCommandBuffer upload_cmd() {
     if (!up_used) {
         up_used = true;
@@ -750,6 +764,7 @@ VkImageView astc_level_view(Texture* tex, uint32_t level, uint32_t layer) {
 /// every layer's chain: Eden's AssembleInto does the same)
 bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     if (tex.type != VK_IMAGE_TYPE_2D || tex.samples != VK_SAMPLE_COUNT_1_BIT || !astc_ready()) return false;
+    upload_work((uint64_t)tex.width * tex.height * tex.layers * 4 / 3);   // (local: its decode, levels and all)
     const uint64_t layer_size = tex.layers > 1 ? tex.L.layer_size : std::max<uint64_t>(tex.L.layer_size, total);
     const uint64_t tail0 = level_geo(tex, 0).offset;
     if (!layer_size || tail0 >= layer_size || (tail0 & 15) || (layer_size & 15)) return false;
@@ -1128,6 +1143,20 @@ uint32_t gpu_owned_since(uint64_t gpu, uint64_t n) {
     return covered >= n && since != UINT32_MAX ? std::max(since, 1u) : 0;
 }
 
+// (local) RX_VK_CHECKPOINTS: each CPU-path upload copy's parameters into the device-lost report's ring
+void note_upload_copy(const Texture& tex, const std::vector<VkBufferImageCopy>& copies) {
+    static const bool on = getenv("RX_VK_CHECKPOINTS") && strcmp(getenv("RX_VK_CHECKPOINTS"), "0") != 0;
+    if (!on || copies.empty()) return;
+    const VkBufferImageCopy& c = copies.front(), &l = copies.back();
+    logf("vk: upload copy #%u %#llx vkfmt %d type %d %ux%ux%u x%u lv %u NVN %#x%s%s: %zu regions; first off %llu row %u h %u lv %u layer %u at y %d ext %ux%ux%u; last lv %u layer %u ext %ux%ux%u",
+               tex.id, (unsigned long long)tex.gpu, (int)tex.format, (int)tex.type, tex.width, tex.height, tex.depth, tex.layers,
+               tex.levels, tex.nvn_format, tex.astc ? " ASTC" : "", tex.sparse ? " SPARSE" : "", copies.size(),
+               (unsigned long long)c.bufferOffset, c.bufferRowLength, c.bufferImageHeight, c.imageSubresource.mipLevel,
+               c.imageSubresource.baseArrayLayer, c.imageOffset.y, c.imageExtent.width, c.imageExtent.height, c.imageExtent.depth,
+               l.imageSubresource.mipLevel, l.imageSubresource.baseArrayLayer, l.imageExtent.width, l.imageExtent.height,
+               l.imageExtent.depth);
+}
+
 bool upload(Texture& tex, const Ranges* dirty) {
     PROF(PROF_UPLOAD);
     if (!tex.gpu || tex.samples != VK_SAMPLE_COUNT_1_BIT) return false;
@@ -1208,7 +1237,7 @@ bool upload(Texture& tex, const Ranges* dirty) {
                 if (!st.buffer) return false;
                 if (buffer && st.buffer != buffer && !copies.empty()) {   // (a new arena: copy what the last one holds)
                     texture_resident_flush(&tex);
-                    checkpoint_mark(upload_cmd(), tex.gpu, 'u');
+                    checkpoint_mark(upload_cmd(), tex.gpu, 'u'); note_upload_copy(tex, copies);
                     vkCmdCopyBufferToImage(upload_cmd(), buffer, tex.image, VK_IMAGE_LAYOUT_GENERAL,
                                            (uint32_t)copies.size(), copies.data());
                     copies.clear();
@@ -1364,7 +1393,7 @@ bool upload(Texture& tex, const Ranges* dirty) {
     }
     if (!copies.empty()) {
         texture_resident_flush(&tex);
-        checkpoint_mark(upload_cmd(), tex.gpu, 'u');
+        checkpoint_mark(upload_cmd(), tex.gpu, 'u'); note_upload_copy(tex, copies);
         vkCmdCopyBufferToImage(upload_cmd(), buffer, tex.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)copies.size(),
                                copies.data());
     }
@@ -2710,6 +2739,14 @@ void texture_gpu_wrote(uint64_t gpu, uint64_t size) {
 }
 /// A finished GPU write into the texture's storage it was not uploaded after (and notes it as seen)
 bool gpu_wrote_into(Texture& tex) {
+    static const bool off = getenv("RX_VK_NO_GPU_REFRESH") != nullptr;   // (local, a test: images a GPU buffer wrote not refreshed)
+    // (local) an image the GPU renders is its own content: a buffer write reaching its storage is not taken over it. The
+    // writes are known only by the range bound (OoT binds a buffer whose range runs 32 KB into the 160x90 lighting target,
+    // NVN 0x14, it never writes there), and the target was re-uploaded whole from memory that never had its rendered texels,
+    // at random frames: Link lit white, the rocks dark (85% of those frames). Textures filled through buffers, never drawn,
+    // keep the refresh. RX_VK_REFRESH_OVER_DRAWN=1: as before
+    static const bool over_drawn = getenv("RX_VK_REFRESH_OVER_DRAWN") != nullptr;
+    if (off) return false;
     std::lock_guard lk(gpu_wrote_mu);
     if (gpu_wrote.empty()) return false;
     const uint64_t lo = tex.gpu, hi = tex.gpu + std::max<uint64_t>(tex.guest_size, 1);
@@ -2717,7 +2754,8 @@ bool gpu_wrote_into(Texture& tex) {
     auto it = gpu_wrote.upper_bound(lo);
     if (it != gpu_wrote.begin()) --it;
     for (; it != gpu_wrote.end() && it->first < hi; ++it)
-        if (it->second.first > lo && it->second.second <= completed_value && it->second.second > tex.gpu_wrote_seen)
+        if (it->second.first > lo && it->second.second <= completed_value && it->second.second > tex.gpu_wrote_seen &&
+            (over_drawn || !tex.gpu_written))
             newest = std::max(newest, it->second.second);
     if (!newest) return false;
     tex.gpu_wrote_seen = newest;
