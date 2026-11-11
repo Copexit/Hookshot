@@ -4,29 +4,98 @@
 // output's size. The network's translation loses the blue channel (the yellow cast); this keeps the picture right at
 // the cost of its temporal anti-aliasing.
 //
-// Against one-frame flashes: the picture before (`hist`, this pass's own last output) bounds each pixel, which may
+// Against one-frame flashes: the picture before (`prev`, this pass's own last output) bounds each pixel, which may
 // rise to 1.5x and fall to 0.6x of it in a frame (a light change or a camera cut settles over a few frames). Some
 // frames' scene colour blows up to white across the picture (or a light term drops out for a frame); those frames
 // came out as full-screen flashes. A NaN or infinite pixel takes the one before. pc.valid = 0 (the first frame, a
 // new size): no bound.
+//
+// (local) pc.mode 1 (RX_VK_TAAU_TEMPORAL=1): a temporal anti-aliasing upscaler in its place. The history (`prev`, the
+// output size, kept in the input's square-root encoding) is read with Catmull-Rom at the pixel moved back by the motion
+// vector (`mv`, pc.mv_on; without it: no motion), boxed by the 3x3 input neighbourhood in YCoCg (min/max, tightened to
+// mean +- gamma * deviation) and blended with the upscaled input by pc.feedback (~0.9). Less weight on large motion,
+// none when the history point leaves the picture, pc.valid = 0 or the history was far outside the box (disocclusion).
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D src;
 layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D dst;
-layout(binding = 2, r11f_g11f_b10f) uniform image2D hist;
-layout(push_constant) uniform P { ivec2 size; int valid; } pc;
+layout(binding = 2, r11f_g11f_b10f) uniform writeonly image2D hist;   // (this frame's history, read as `prev` next frame)
+layout(binding = 3) uniform sampler2D prev;                            // (last frame's)
+layout(binding = 4) uniform sampler2D mv;
+layout(push_constant) uniform P {
+    ivec2 size;
+    int valid;
+    int mode;      // 0: the linear stand-in above, 1: temporal
+    int mv_on;
+    float feedback;
+    float gamma;   // (the box's half width in deviations)
+    float pad;
+    vec2 mv_scale; // (motion in uv = (mv.rg - mv_bias) * mv_scale; history at uv - motion)
+    vec2 mv_bias;
+} pc;
+
+vec3 ycocg(vec3 c) { return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b); }
+vec3 rgb(vec3 y) { return vec3(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z); }
+vec3 fix(vec3 c) { return any(isnan(c)) || any(isinf(c)) ? vec3(0.0) : max(c, vec3(0.0)); }
+
+// Catmull-Rom from 5 bilinear taps (the corners' weights left out)
+vec3 catmull_rom(vec2 uv) {
+    const vec2 ts = vec2(textureSize(prev, 0));
+    const vec2 p = uv * ts, c = floor(p - 0.5) + 0.5, f = p - c;
+    const vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    const vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
+    const vec2 w12 = w1 + w2, t0 = (c - 1.0) / ts, t3 = (c + 2.0) / ts, t12 = (c + w2 / w12) / ts;
+    vec3 r = textureLod(prev, vec2(t12.x, t0.y), 0.0).rgb * (w12.x * w0.y) +
+             textureLod(prev, vec2(t0.x, t12.y), 0.0).rgb * (w0.x * w12.y) +
+             textureLod(prev, t12, 0.0).rgb * (w12.x * w12.y) +
+             textureLod(prev, vec2(t3.x, t12.y), 0.0).rgb * (w3.x * w12.y) +
+             textureLod(prev, vec2(t12.x, t3.y), 0.0).rgb * (w12.x * w3.y);
+    const float w = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return max(r / w, vec3(0.0));
+}
+
 void main() {
     const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(g, pc.size))) return;
     const vec2 uv = (vec2(g) + 0.5) / vec2(pc.size);
     // (the input is the square root of the scene colour, the network's perceptual encoding, which its output undoes:
     // 6637ac1d's means 0.58 0.50 0.27 -> 0.77 0.69 0.49)
-    const vec3 s = textureLod(src, uv, 0.0).rgb;
-    vec3 c = s * s;
-    if (pc.valid != 0) {
-        const vec3 p = imageLoad(hist, g).rgb;
-        c = mix(c, p, bvec3(isnan(c.r) || isinf(c.r), isnan(c.g) || isinf(c.g), isnan(c.b) || isinf(c.b)));
-        c = clamp(c, p * 0.6, p * 1.5 + 0.01);
+    if (pc.mode == 0) {
+        const vec3 s = textureLod(src, uv, 0.0).rgb;
+        vec3 c = s * s;
+        if (pc.valid != 0) {
+            const vec3 p = texelFetch(prev, g, 0).rgb;
+            c = mix(c, p, bvec3(isnan(c.r) || isinf(c.r), isnan(c.g) || isinf(c.g), isnan(c.b) || isinf(c.b)));
+            c = clamp(c, p * 0.6, p * 1.5 + 0.01);
+        }
+        imageStore(dst, g, vec4(c, 1.0));
+        imageStore(hist, g, vec4(c, 1.0));
+        return;
     }
-    imageStore(dst, g, vec4(c, 1.0));
-    imageStore(hist, g, vec4(c, 1.0));
+    // (temporal, all in the square-root encoding: the blend is then perceptual, a bright pixel does not dominate)
+    const vec2 it = 1.0 / vec2(textureSize(src, 0));
+    const vec3 cur = fix(textureLod(src, uv, 0.0).rgb);
+    vec3 lo = vec3(1e9), hi = vec3(-1e9), m1 = vec3(0.0), m2 = vec3(0.0);
+    for (int y = -1; y <= 1; y++)
+        for (int x = -1; x <= 1; x++) {
+            const vec3 t = ycocg(x == 0 && y == 0 ? cur : fix(textureLod(src, uv + vec2(x, y) * it, 0.0).rgb));
+            lo = min(lo, t), hi = max(hi, t), m1 += t, m2 += t * t;
+        }
+    m1 /= 9.0;
+    const vec3 sd = sqrt(max(m2 / 9.0 - m1 * m1, vec3(0.0)));
+    lo = max(lo, m1 - pc.gamma * sd), hi = min(hi, m1 + pc.gamma * sd);
+    vec2 motion = vec2(0.0);
+    if (pc.mv_on != 0) motion = (textureLod(mv, uv, 0.0).rg - pc.mv_bias) * pc.mv_scale;
+    if (any(isnan(motion)) || any(isinf(motion))) motion = vec2(0.0);
+    const vec2 puv = uv - motion;
+    const float px = length(motion * vec2(pc.size));   // (output pixels moved)
+    vec3 o = cur;
+    if (pc.valid != 0 && all(greaterThanEqual(puv, vec2(0.0))) && all(lessThanEqual(puv, vec2(1.0))) && px < 64.0) {
+        const vec3 h = ycocg(catmull_rom(puv)), hc = clamp(h, lo, hi);
+        // (history far outside the box: something new is here, it is left to fade fast)
+        const float off = length(h - hc) / max(hi.x - lo.x + 0.02, 0.02);
+        const float fb = pc.feedback * mix(1.0, 0.7, clamp(px / 16.0, 0.0, 1.0)) * mix(1.0, 0.5, clamp(off - 1.0, 0.0, 1.0));
+        o = max(rgb(mix(ycocg(cur), hc, fb)), vec3(0.0));
+    }
+    imageStore(hist, g, vec4(o, 1.0));
+    imageStore(dst, g, vec4(o * o, 1.0));
 }

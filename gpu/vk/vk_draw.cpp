@@ -5787,8 +5787,67 @@ static bool movie_keep_all_networks() {
     return keep;
 }
 
+// (local) shaders/taau_upscale.comp's push constants
+struct TaauPush {
+    int32_t size[2];
+    int32_t valid, mode, mv_on;
+    float feedback, gamma, pad;
+    float mv_scale[2], mv_bias[2];
+};
+static_assert(sizeof(TaauPush) == 48);
 static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageView output_view,
-                          Texture* out, uint32_t level, uint64_t key, const char* keys, bool temporal);
+                          Texture* out, uint32_t level, uint64_t key, const char* keys, bool temporal,
+                          const NvnState* s = nullptr);
+bool taau_key(uint64_t key);
+/// (local) RX_VK_TAAU_TEMPORAL=1: the TAAU stand-in (taau_stand_in, and upscale_stub's RGB9E5 fallback for a key in
+/// RX_VK_TAAU_KEYS) is a temporal anti-aliasing upscaler, shaders/taau_upscale.comp mode 1, in place of a linear upscale
+static bool taau_temporal() {
+    static const bool on = getenv("RX_VK_TAAU_TEMPORAL") && atoi(getenv("RX_VK_TAAU_TEMPORAL")) != 0;
+    return on;
+}
+/// (local) The stood-in dispatch's texture and image banks with their slots, once a key (RX_VK_TAAU_TEMPORAL=1): which
+/// one holds the motion vectors, for RX_VK_TAAU_MV
+static void taau_log_bank(const NvnState& s, uint64_t key, const char* path) {
+    static std::mutex mu;
+    static std::unordered_set<uint64_t> seen;
+    {
+        std::lock_guard lk(mu);
+        if (seen.size() >= 16 || !seen.insert(key).second) return;
+    }
+    char line[2400];
+    int n = snprintf(line, sizeof line, "vk: taau %016llx (%s) banks:", (unsigned long long)key, path);
+    const auto one = [&](const char* what, int slot, uint64_t h) {
+        nvn_tex t;
+        nvn_view v;
+        bool hv = false;
+        if (!h || !texture_of((int)(h & 0xFFFFF), &t, &v, &hv) || n >= (int)sizeof line - 96) return;
+        n += snprintf(line + n, sizeof line - n, " %s%d %#llx %ux%ux%u fmt %#x;", what, slot, (unsigned long long)t.gpu,
+                      t.d.width, t.d.height, t.d.depth, (unsigned)t.d.format);
+    };
+    for (int i = 0; i < 32; i++) one("img", i, s.img[5][i]);
+    for (int i = 0; i < 32; i++) one("tex", i, s.tex[5][i]);
+    logf("%s", line);
+}
+/// (local) RX_VK_TAAU_MV=<texture bank slot> (from the "vk: taau ... banks" line): that texture as the motion vectors of
+/// the temporal stand-in, motion in uv = (its .rg - RX_VK_TAAU_MV_BIAS) * RX_VK_TAAU_MV_SCALE (each "x,y" or one value
+/// for both; defaults 0 and 1), the history read at uv - motion. Unset, or a texture that cannot be filtered (an integer
+/// format): no motion, the history at the same pixel with a tighter box (RX_VK_TAAU_GAMMA)
+static VkImageView taau_motion(const NvnState& s, float scale[2], float bias[2]) {
+    static const int slot = getenv("RX_VK_TAAU_MV") ? atoi(getenv("RX_VK_TAAU_MV")) : -1;
+    const auto pair = [](const char* e, float d, float o[2]) {
+        o[0] = o[1] = d;
+        if (e && sscanf(e, "%f,%f", &o[0], &o[1]) == 1) o[1] = o[0];
+    };
+    pair(getenv("RX_VK_TAAU_MV_SCALE"), 1.0f, scale);
+    pair(getenv("RX_VK_TAAU_MV_BIAS"), 0.0f, bias);
+    if (slot < 0 || slot >= 128 || !s.tex[5][slot]) return VK_NULL_HANDLE;
+    Texture* t = nullptr;
+    const VkImageView v = texture_view_of((uint32_t)s.tex[5][slot], VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample, VK_FORMAT_UNDEFINED, &t);
+    if (!v || !t || t->bc || t->samples != VK_SAMPLE_COUNT_1_BIT) return VK_NULL_HANDLE;
+    VkFormatProperties f{};
+    vkGetPhysicalDeviceFormatProperties(dev.physical, t->format, &f);
+    return f.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT ? v : VK_NULL_HANDLE;
+}
 
 bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
     static const bool off = getenv("RX_VK_NO_UPSCALE_STUB") != nullptr;
@@ -5873,7 +5932,8 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
             const VkImageView output_view = texture_view(dst, &out, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage,
                                                          &output_format, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
             if (input_format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && output_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
-                typed_upscale(cmd, input_view, output_view, dst, 0, key, "generic RGB9E5 fallback", false)) {
+                typed_upscale(cmd, input_view, output_view, dst, 0, key, "generic RGB9E5 fallback",
+                              taau_temporal() && taau_key(key), &s)) {   // (local) temporal: a key in RX_VK_TAAU_KEYS
                 full_barrier(cmd);
                 texture_written(dst);
                 return true;
@@ -5925,7 +5985,7 @@ bool taau_key(uint64_t key) {
     return match;
 }
 static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageView output_view,
-                          Texture* out, uint32_t level, uint64_t key, const char* keys, bool temporal) {
+                          Texture* out, uint32_t level, uint64_t key, const char* keys, bool temporal, const NvnState* s) {
     if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR || !input_view || !output_view || !out) return false;
     static VkPipeline pipe = VK_NULL_HANDLE;
     static VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -5933,15 +5993,18 @@ static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageVi
     static bool tried = false;
     if (!tried) {
         tried = true;
-        VkDescriptorSetLayoutBinding b[3] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        // (local) 3: last frame's history, sampled (Catmull-Rom); 4: the motion vectors (the input when there are none)
+        VkDescriptorSetLayoutBinding b[5] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
                                              {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-                                             {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+                                             {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                             {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                             {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
         VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-        li.bindingCount = 3, li.pBindings = b;
+        li.bindingCount = 5, li.pBindings = b;
         VkDescriptorSetLayout set{};
         vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &set);
-        const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 12};
+        const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TaauPush)};
         VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pi.setLayoutCount = 1, pi.pSetLayouts = &set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
         vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout);
@@ -5963,21 +6026,20 @@ static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageVi
              pipe ? "" : ": its pipeline was not made");
     }
     if (!pipe) return false;
-    uint32_t size[3] = {std::max(1u, out->width >> level), std::max(1u, out->height >> level), 0};
+    const uint32_t size[2] = {std::max(1u, out->width >> level), std::max(1u, out->height >> level)};
     // (the stand-in's last output, which bounds this one's pixels: shaders/taau_upscale.comp. Made again at a new size,
     // the first frame unbounded; RX_VK_TAAU_NO_CLAMP=1: never bounded)
+    // (local) two of them, one read (sampled: the temporal stand-in moves its reads by the motion) while the other is
+    // written, in turn
     struct History {
-        VkImage image = VK_NULL_HANDLE;
-        VmaAllocation memory = nullptr;
-        VkImageView view = VK_NULL_HANDLE;
-        uint32_t width = 0, height = 0;
+        VkImage image[2]{};
+        VmaAllocation memory[2]{};
+        VkImageView view[2]{};
+        uint32_t width = 0, height = 0, cur = 0;
         uint64_t frame = 0;
     };
     static History histories[2];
     History& history = histories[temporal ? 0 : 1];
-    auto& hist = history.image;
-    auto& hist_mem = history.memory;
-    auto& hist_view = history.view;
     auto& hist_w = history.width;
     auto& hist_h = history.height;
     auto& hist_frame = history.frame;
@@ -5995,39 +6057,69 @@ static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageVi
         destroy_image(old_hist[i].image, old_hist[i].mem);
         old_hist.erase(old_hist.begin() + (ptrdiff_t)i);
     }
-    if (hist_w != size[0] || hist_h != size[1]) {
-        // (the one before is kept for the while: work in flight may still use it)
-        if (hist && !leak) old_hist.push_back({hist, hist_mem, hist_view, texture_frame_no()});
-        hist = VK_NULL_HANDLE, hist_view = VK_NULL_HANDLE;
-        VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ic.imageType = VK_IMAGE_TYPE_2D, ic.format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-        ic.extent = {size[0], size[1], 1}, ic.mipLevels = 1, ic.arrayLayers = 1, ic.samples = VK_SAMPLE_COUNT_1_BIT;
-        ic.tiling = VK_IMAGE_TILING_OPTIMAL, ic.usage = VK_IMAGE_USAGE_STORAGE_BIT;
-        if (!create_image(ic, hist, hist_mem)) { hist = VK_NULL_HANDLE; return false; }
-        VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vc.image = hist, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = ic.format;
-        vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCreateImageView(dev.device, &vc, nullptr, &hist_view);
-        VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};   // (UNDEFINED -> GENERAL, once)
-        ib.srcStageMask = VK_PIPELINE_STAGE_2_NONE, ib.srcAccessMask = VK_ACCESS_2_NONE;
-        ib.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        ib.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        ib.image = hist, ib.subresourceRange = vc.subresourceRange;
-        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &ib;
-        vkCmdPipelineBarrier2(cmd, &di);
+    if (hist_w != size[0] || hist_h != size[1] || !history.image[0] || !history.image[1]) {
+        for (int k = 0; k < 2; k++) {
+            auto& hist = history.image[k];
+            auto& hist_mem = history.memory[k];
+            auto& hist_view = history.view[k];
+            // (the one before is kept for the while: work in flight may still use it)
+            if (hist && !leak) old_hist.push_back({hist, hist_mem, hist_view, texture_frame_no()});
+            hist = VK_NULL_HANDLE, hist_view = VK_NULL_HANDLE;
+            VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ic.imageType = VK_IMAGE_TYPE_2D, ic.format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+            ic.extent = {size[0], size[1], 1}, ic.mipLevels = 1, ic.arrayLayers = 1, ic.samples = VK_SAMPLE_COUNT_1_BIT;
+            ic.tiling = VK_IMAGE_TILING_OPTIMAL, ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            if (!create_image(ic, hist, hist_mem)) { hist = VK_NULL_HANDLE; hist_w = hist_h = 0; return false; }
+            VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vc.image = hist, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = ic.format;
+            vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCreateImageView(dev.device, &vc, nullptr, &hist_view);
+            VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};   // (UNDEFINED -> GENERAL, once)
+            ib.srcStageMask = VK_PIPELINE_STAGE_2_NONE, ib.srcAccessMask = VK_ACCESS_2_NONE;
+            ib.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            ib.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+            ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            ib.image = hist, ib.subresourceRange = vc.subresourceRange;
+            VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &ib;
+            vkCmdPipelineBarrier2(cmd, &di);
+        }
         hist_w = size[0], hist_h = size[1], hist_frame = 0;
     }
     // (bounded when the history is last frame's or so: a pause of the TAAU, a menu, starts again unbounded)
     const uint64_t now_frame = texture_frame_no();
-    size[2] = temporal && !no_clamp && hist_frame && now_frame - hist_frame <= 3 ? 1u : 0u;
+    const bool recent = hist_frame && now_frame - hist_frame <= 3;
     hist_frame = now_frame;
+    TaauPush pc{};
+    pc.size[0] = (int32_t)size[0], pc.size[1] = (int32_t)size[1];
+    // (local) RX_VK_TAAU_TEMPORAL=1: the temporal stand-in (mode 1), its history used when it is last frame's or so.
+    // RX_VK_TAAU_FEEDBACK (0.9): the history's share; RX_VK_TAAU_GAMMA: the box's half width in deviations (1.25 with
+    // motion vectors, 1.0 without: tighter, against ghosting where the motion is not known)
+    const bool taa = temporal && taau_temporal();
+    VkImageView mv_view = VK_NULL_HANDLE;
+    float mv_scale[2] = {1, 1}, mv_bias[2] = {0, 0};
+    if (taa && s) {
+        taau_log_bank(*s, key, keys);
+        mv_view = taau_motion(*s, mv_scale, mv_bias);
+    }
+    static const float feedback = getenv("RX_VK_TAAU_FEEDBACK") ? (float)atof(getenv("RX_VK_TAAU_FEEDBACK")) : 0.9f;
+    static const float gamma = getenv("RX_VK_TAAU_GAMMA") ? (float)atof(getenv("RX_VK_TAAU_GAMMA")) : -1.0f;
+    pc.mode = taa ? 1 : 0;
+    pc.valid = taa ? (recent ? 1 : 0) : (temporal && !no_clamp && recent ? 1 : 0);
+    pc.mv_on = mv_view ? 1 : 0;
+    pc.feedback = std::clamp(feedback, 0.0f, 0.98f);
+    pc.gamma = gamma > 0 ? gamma : mv_view ? 1.25f : 1.0f;
+    pc.mv_scale[0] = mv_scale[0], pc.mv_scale[1] = mv_scale[1], pc.mv_bias[0] = mv_bias[0], pc.mv_bias[1] = mv_bias[1];
+    const uint32_t rd = history.cur, wr = rd ^ 1u;
+    history.cur = wr;
     const VkDescriptorImageInfo in_info{linear, input_view, VK_IMAGE_LAYOUT_GENERAL};
     const VkDescriptorImageInfo out_info{VK_NULL_HANDLE, output_view, VK_IMAGE_LAYOUT_GENERAL};
-    const VkDescriptorImageInfo hist_info{VK_NULL_HANDLE, hist_view, VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet w[3]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
+    const VkDescriptorImageInfo hist_info{VK_NULL_HANDLE, history.view[wr], VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo prev_info{linear, history.view[rd], VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo mv_info{linear, mv_view ? mv_view : input_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w[5]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
+                              {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
                               {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
     w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     w[0].pImageInfo = &in_info;
@@ -6035,9 +6127,13 @@ static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageVi
     w[1].pImageInfo = &out_info;
     w[2].dstBinding = 2, w[2].descriptorCount = 1, w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     w[2].pImageInfo = &hist_info;
+    w[3].dstBinding = 3, w[3].descriptorCount = 1, w[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[3].pImageInfo = &prev_info;
+    w[4].dstBinding = 4, w[4].descriptorCount = 1, w[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[4].pImageInfo = &mv_info;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 3, w);
-    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, size);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 5, w);
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
     vkCmdDispatch(cmd, (size[0] + 7) / 8, (size[1] + 7) / 8, 1);
     descriptors_disturbed();   // (the program's own pushes are gone from the bind point)
     if (temporal) probe_image(cmd, out, level, 0, key, 't');
@@ -6088,7 +6184,7 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     texture_view_of(handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, image_format(od.format), &out, &level);
     if (!out || out->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) return false;
     const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS") : "fd029a317a9a4b94";
-    return typed_upscale(cmd, dw().imgs[0].imageView, dw().imgs[ntex].imageView, out, level, p.key, keys, true);
+    return typed_upscale(cmd, dw().imgs[0].imageView, dw().imgs[ntex].imageView, out, level, p.key, keys, true, &s);
 }
 
 bool precompile_wanted() {
