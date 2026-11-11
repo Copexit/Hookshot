@@ -154,8 +154,50 @@ struct Recording {
     uint64_t batch = 0;   // (RX_VK_BATCH: the batch it went out in, waited for on batch_tl; 0: its own fence)
     std::vector<VkCommandBuffer> extra_uploads;   // (local: upload command buffers sent ahead, upload_split)
     size_t extra_used = 0;
+    // (local, meshsync, RX_VK_MESH_HOIST) cmd as allocated (a hoist window moves cmd on to one of more); the windows' command buffers
+    // before cmd, in queue order (each window's three hoist command buffers, then its commands); the open window's hoist buffers
+    VkCommandBuffer base_cmd = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> more, chain;
+    size_t more_used = 0;
+    VkCommandBuffer pre[3]{};
+    bool pre_on = false;
 };
 Recording* cur_recording = nullptr;   // (local: the one begin_recording began, for upload_split)
+thread_local Recording* tl_rec = nullptr;   // (local, meshsync: the recording this thread records into, for hoist_pre / hoist_split)
+/// (meshsync) A recording slot begun again: its first command buffer, no windows
+void recording_windows_reset(Recording& r) {
+    if (r.base_cmd) r.cmd = r.base_cmd;
+    r.more_used = 0, r.chain.clear(), r.pre_on = false;
+}
+/// (meshsync) One more command buffer of r's pool (its thread's), not begun; null: none could be had
+VkCommandBuffer recording_more(Recording& r) {
+    if (r.more_used == r.more.size()) {
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = r.pool, ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, ai.commandBufferCount = 1;
+        VkCommandBuffer c = VK_NULL_HANDLE;
+        if (vkAllocateCommandBuffers(dev.device, &ai, &c) != VK_SUCCESS) return VK_NULL_HANDLE;
+        r.more.push_back(c);
+    }
+    return r.more[r.more_used++];
+}
+/// (meshsync) The open window's hoist command buffers ended (the last with its barrier) and put in the queue order
+void recording_close_pre(Recording& r) {
+    if (!r.pre_on) return;
+    draw_pre_finish(r.pre[2]);
+    for (VkCommandBuffer c : r.pre) vkEndCommandBuffer(c), r.chain.push_back(c);
+    r.pre_on = false;
+}
+/// (meshsync) r's command buffers after its uploads, in queue order: the earlier windows', the open window's hoist ones, cmd
+void recording_cbs(Recording& r, std::vector<VkCommandBufferSubmitInfo>& out) {
+    for (VkCommandBuffer c : r.chain) {
+        VkCommandBufferSubmitInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+        b.commandBuffer = c;
+        out.push_back(b);
+    }
+    VkCommandBufferSubmitInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    b.commandBuffer = r.cmd;
+    out.push_back(b);
+}
 // (24: the event waits cut a frame's command buffers into pieces, each with recordings of its own, and with 16 the
 // replay waited ~1.5 ms a frame for a slot the GPU still had)
 constexpr int kRecordings = 48;   // (test: 24 before; with RX_VK_BATCH the ring came round to held submits once a frame)
@@ -359,6 +401,8 @@ Recording& begin_recording(uint64_t value) {
     }
     vkResetCommandPool(dev.device, r.pool, 0);
     vkResetCommandPool(dev.device, r.upload_pool, 0);
+    recording_windows_reset(r);
+    tl_rec = &r;
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(r.cmd, &bi);
@@ -380,19 +424,20 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     gprof_submitted(r.slot, uploads);
     gpu_time_end(r);
     const VkCommandBuffer up = texture_upload_cmd_current();   // (local: r.upload, or the last one upload_split began)
+    recording_close_pre(r);
     vkEndCommandBuffer(up);
     vkEndCommandBuffer(r.cmd);
     VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     signal.semaphore = timeline;
     signal.value = !signal_value && early_at ? early_at : signal_at ? signal_at : r.value;
     signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    VkCommandBufferSubmitInfo cb[2]{{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
-    uint32_t n = 0;
-    if (uploads) cb[n++].commandBuffer = up;
-    cb[n++].commandBuffer = r.cmd;
+    std::vector<VkCommandBufferSubmitInfo> cb;   // (local, meshsync: and the hoist windows', recording_cbs)
+    if (uploads) cb.push_back({VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}), cb.back().commandBuffer = up;
+    recording_cbs(r, cb);
+    const uint32_t n = (uint32_t)cb.size();
     VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
     si.commandBufferInfoCount = n;
-    si.pCommandBufferInfos = cb;
+    si.pCommandBufferInfos = cb.data();
     VkSemaphoreSubmitInfo signals[2] = {signal, {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO}};
     uint32_t nsig = signal_value || early_at ? 1 : 0;
     uint64_t seq = 0;
@@ -456,6 +501,23 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
 // past the kernel's 10 s took the GPU down (RADV RENOIR, Link's house and Hyrule Field loads). Queue order keeps them ahead
 // of the recording's own commands. Called by vk_texture.cpp past its work budget.
 }  // namespace (local: upload_split is vk_texture.cpp's too)
+int hoist_pre(VkCommandBuffer cmd, VkCommandBuffer* out) {   // (local, meshsync: vk_internal.h)
+    Recording* r = tl_rec;
+    if (!r || r->cmd != cmd) return 0;
+    int got = 1;
+    if (!r->pre_on) {
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        for (VkCommandBuffer& c : r->pre) {
+            c = recording_more(*r);
+            if (!c) return 0;   // (none begun yet: the ones taken stay unused)
+        }
+        for (VkCommandBuffer c : r->pre) vkBeginCommandBuffer(c, &bi);
+        r->pre_on = true, got = 2;
+    }
+    for (int k = 0; k < 3; k++) out[k] = r->pre[k];
+    return got;
+}
 VkCommandBuffer upload_split(VkCommandBuffer old) {
     Recording* r = cur_recording;
     if (!r || !old) return old;
@@ -852,6 +914,23 @@ void log_stage_bind(uint32_t op, int stage) {
 }
 
 void maybe_split(VkCommandBuffer& cmd);
+/// (local, meshsync, RX_VK_MESH_HOIST) The recording goes on in another command buffer of it (same submission, queue order kept), a new
+/// hoist window: the mesh draws after a write in the old one can have their fallback compute hoisted again. The pass ends here once
+void hoist_split(VkCommandBuffer& cmd) {
+    Recording* r = tl_rec;
+    if (!r || r->cmd != cmd) return;
+    const VkCommandBuffer next = recording_more(*r);
+    if (!next) return;
+    end_pass(cmd);
+    recording_close_pre(*r);
+    vkEndCommandBuffer(cmd);
+    r->chain.push_back(cmd);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(next, &bi);
+    r->cmd = cmd = next;
+    draw_cmd_switched(next);
+}
 
 /// The handles already stored, so a rebind of the same ones does not rebuild descriptors
 bool handles_unchanged(const uint64_t* have, const uint64_t* next, int n) {
@@ -1370,6 +1449,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 logf("vk: mesh draw kind %d: %d %d %d, indirect %#llx count %#llx max %d stride %d", d.kind, d.x, d.y,
                      d.z, (unsigned long long)d.indirect, (unsigned long long)d.count_addr, d.max, d.stride);
             if (s.render_enabled && !s.raster_discard && !dry) {
+                if (draw_hoist_wants_split()) hoist_split(cmd);   // (local, meshsync, RX_VK_MESH_HOIST)
                 DrawArgs da;
                 da.mesh = true;
                 // (DrawMeshTasks(first, count): the count of task workgroups, as Eden draws NVN2's mesh draws; a
@@ -1505,6 +1585,7 @@ Recording& begin_segment_recording(uint64_t value) {
         gprof_collect(r.slot);
     }
     vkResetCommandPool(dev.device, r.pool, 0);
+    recording_windows_reset(r);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(r.cmd, &bi);
@@ -1573,12 +1654,16 @@ void run_job(SegJob* j, std::mutex& seg_mu, std::condition_variable& seg_cv) {
     texture_set_segment(j->order);
     texture_segment_worker(j->index);
     texture_begin_recording(j->r->upload, j->r->value);
+    Recording* const outer = tl_rec;   // (local, meshsync: the replay thread runs jobs too)
+    tl_rec = j->r;
     draw_begin_recording(j->r->slot, j->r->cmd, j->r->value);
     VkCommandBuffer c = j->r->cmd;
     record_segment(c, j->g);
     j->uploads = texture_uploads_recorded();
     j->inits = texture_segment_end(j->index);   // (after its last new image)
     texture_segment_worker(-1);
+    recording_close_pre(*j->r);
+    tl_rec = outer;
     vkEndCommandBuffer(j->r->upload);
     vkEndCommandBuffer(j->r->cmd);
     {
@@ -1598,18 +1683,15 @@ void submit_jobs(std::vector<std::unique_ptr<SegJob>>& jobs, std::mutex& seg_mu,
         }
         if (j->inits < 0) init_lost = true;   // (its init command buffer could not be ended: the replay stops, below)
         if (init_lost) continue;              // (nothing from it on is submitted)
-        VkCommandBufferSubmitInfo cb[3]{{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO},
-                                        {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
-        uint32_t n = 0;
-        if (j->inits > 0) cb[n++].commandBuffer = j->r->init;   // (new images made in it or after it: first in the queue)
-        if (j->uploads) cb[n++].commandBuffer = j->r->upload;
-        cb[n++].commandBuffer = j->r->cmd;
+        std::vector<VkCommandBufferSubmitInfo> cb;   // (local, meshsync: and the hoist windows', recording_cbs)
+        if (j->inits > 0) cb.push_back({VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}), cb.back().commandBuffer = j->r->init;   // (new images made in it or after it: first in the queue)
+        if (j->uploads) cb.push_back({VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}), cb.back().commandBuffer = j->r->upload;
+        recording_cbs(*j->r, cb);
+        const uint32_t n = (uint32_t)cb.size();
         VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
         std::lock_guard lk(dev.present_mu);
         queue_flush_locked();
-        VkCommandBufferSubmitInfo tcb[5]{{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO},
-                                         {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO},
-                                         {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
+        std::vector<VkCommandBufferSubmitInfo> tcb(n + 2, VkCommandBufferSubmitInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO});
         if (tl::on.load(std::memory_order_relaxed) && tl::gpu_ready && tl::n_batches < tl::kBatches) {   // (RX_VK_TL: a segment's stamps)
             const uint32_t b = tl::n_batches++;
             tcb[0].commandBuffer = tl::cb_begin[b];
@@ -1618,10 +1700,10 @@ void submit_jobs(std::vector<std::unique_ptr<SegJob>>& jobs, std::mutex& seg_mu,
             tl::batches[b] = {tl::now_ns(), n, 7};
             tl::ev(tl::FLUSH, b, 7);
             si.commandBufferInfoCount = n + 2;
-            si.pCommandBufferInfos = tcb;
+            si.pCommandBufferInfos = tcb.data();
         } else {
             si.commandBufferInfoCount = n;
-            si.pCommandBufferInfos = cb;
+            si.pCommandBufferInfos = cb.data();
         }
         const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, j->r->fence);
         j->r->submitted = res == VK_SUCCESS;
@@ -4688,6 +4770,7 @@ bool replay_start() {
         ai.commandPool = r.pool;
         ai.commandBufferCount = 1;
         vkAllocateCommandBuffers(dev.device, &ai, &r.cmd);
+        r.base_cmd = r.cmd;   // (local, meshsync)
         ai.commandPool = r.upload_pool;
         vkAllocateCommandBuffers(dev.device, &ai, &r.upload);
     }

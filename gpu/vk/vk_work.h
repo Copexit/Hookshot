@@ -12,11 +12,22 @@ namespace mkwvk {
 extern std::atomic<uint64_t> work_epoch;   // (vk_texture.cpp)
 extern thread_local VkCommandBuffer barrier_pending_cmd;   // (vk_texture.cpp, RX_VK_BARRIER_DEFER: the game's barrier held back)
 void barrier_flush_pending();
+// (local, meshsync) RX_VK_MESH_HOIST: a command that writes memory (a dispatch, a copy, a fill, a clear) recorded on the command buffer
+// whose mesh fallback compute is hoisted ahead of it: the compute of later mesh draws may read what it writes, so they are not hoisted
+// past it (vk_draw.cpp). Draws and passes do not count: a mesh program reads no render target
+extern thread_local VkCommandBuffer hoist_watch_cmd;   // (vk_texture.cpp)
+extern thread_local bool hoist_blocked;
+extern thread_local uint64_t tl_work_n;   // (this thread's work commands: begin_pass's resume test)
 inline void note_work() {
     if (barrier_pending_cmd) barrier_flush_pending();   // (recorded before the work, on the command buffer it was for)
     // (an add, not a load and a store: a thread preempted between the two would store a stale count over another thread's, which could
     // make the count equal the one a barrier was recorded at with work recorded since, and the next barrier is left out for it)
     work_epoch.fetch_add(1, std::memory_order_relaxed);
+    tl_work_n++;
+}
+template <class... A>
+inline void note_producer(VkCommandBuffer c, const A&...) {
+    if (c == hoist_watch_cmd) hoist_blocked = true;
 }
 inline void note_end(VkCommandBuffer c) {   // (a held-back barrier goes in before its command buffer ends)
     if (barrier_pending_cmd == c && c) barrier_flush_pending();
@@ -36,18 +47,18 @@ inline void note_end(VkCommandBuffer c) {   // (a held-back barrier goes in befo
 #define vkCmdDrawMeshTasksEXT(...) (::mkwvk::note_work(), ::vkx::vkCmdDrawMeshTasksEXT(__VA_ARGS__))
 #define vkCmdDrawMeshTasksIndirectEXT(...) (::mkwvk::note_work(), ::vkx::vkCmdDrawMeshTasksIndirectEXT(__VA_ARGS__))
 #define vkCmdDrawMeshTasksIndirectCountEXT(...) (::mkwvk::note_work(), ::vkx::vkCmdDrawMeshTasksIndirectCountEXT(__VA_ARGS__))
-#define vkCmdDispatch(...) (::mkwvk::note_work(), ::vkx::vkCmdDispatch(__VA_ARGS__))
-#define vkCmdDispatchIndirect(...) (::mkwvk::note_work(), ::vkx::vkCmdDispatchIndirect(__VA_ARGS__))
-#define vkCmdCopyBuffer(...) (::mkwvk::note_work(), ::vkx::vkCmdCopyBuffer(__VA_ARGS__))
-#define vkCmdCopyBufferToImage(...) (::mkwvk::note_work(), ::vkx::vkCmdCopyBufferToImage(__VA_ARGS__))
-#define vkCmdCopyImageToBuffer(...) (::mkwvk::note_work(), ::vkx::vkCmdCopyImageToBuffer(__VA_ARGS__))
-#define vkCmdCopyImage(...) (::mkwvk::note_work(), ::vkx::vkCmdCopyImage(__VA_ARGS__))
-#define vkCmdBlitImage(...) (::mkwvk::note_work(), ::vkx::vkCmdBlitImage(__VA_ARGS__))
-#define vkCmdResolveImage(...) (::mkwvk::note_work(), ::vkx::vkCmdResolveImage(__VA_ARGS__))
-#define vkCmdClearColorImage(...) (::mkwvk::note_work(), ::vkx::vkCmdClearColorImage(__VA_ARGS__))
-#define vkCmdClearDepthStencilImage(...) (::mkwvk::note_work(), ::vkx::vkCmdClearDepthStencilImage(__VA_ARGS__))
+#define vkCmdDispatch(...) ([](const auto&... a_) { ::mkwvk::note_work(), ::mkwvk::note_producer(a_...); return ::vkx::vkCmdDispatch(a_...); }(__VA_ARGS__))
+#define vkCmdDispatchIndirect(...) ([](const auto&... a_) { ::mkwvk::note_work(), ::mkwvk::note_producer(a_...); return ::vkx::vkCmdDispatchIndirect(a_...); }(__VA_ARGS__))
+#define vkCmdCopyBuffer(...) ([](const auto&... a_) { ::mkwvk::note_work(), ::mkwvk::note_producer(a_...); return ::vkx::vkCmdCopyBuffer(a_...); }(__VA_ARGS__))
+#define vkCmdCopyBufferToImage(...) ([](const auto&... a_) { ::mkwvk::note_work(), ::mkwvk::note_producer(a_...); return ::vkx::vkCmdCopyBufferToImage(a_...); }(__VA_ARGS__))
+#define vkCmdCopyImageToBuffer(...) ([](const auto&... a_) { ::mkwvk::note_work(), ::mkwvk::note_producer(a_...); return ::vkx::vkCmdCopyImageToBuffer(a_...); }(__VA_ARGS__))
+#define vkCmdCopyImage(...) ([](const auto&... a_) { ::mkwvk::note_work(), ::mkwvk::note_producer(a_...); return ::vkx::vkCmdCopyImage(a_...); }(__VA_ARGS__))
+#define vkCmdBlitImage(...) ([](const auto&... a_) { ::mkwvk::note_work(), ::mkwvk::note_producer(a_...); return ::vkx::vkCmdBlitImage(a_...); }(__VA_ARGS__))
+#define vkCmdResolveImage(...) ([](const auto&... a_) { ::mkwvk::note_work(), ::mkwvk::note_producer(a_...); return ::vkx::vkCmdResolveImage(a_...); }(__VA_ARGS__))
+#define vkCmdClearColorImage(...) ([](const auto&... a_) { ::mkwvk::note_work(), ::mkwvk::note_producer(a_...); return ::vkx::vkCmdClearColorImage(a_...); }(__VA_ARGS__))
+#define vkCmdClearDepthStencilImage(...) ([](const auto&... a_) { ::mkwvk::note_work(), ::mkwvk::note_producer(a_...); return ::vkx::vkCmdClearDepthStencilImage(a_...); }(__VA_ARGS__))
 #define vkCmdClearAttachments(...) (::mkwvk::note_work(), ::vkx::vkCmdClearAttachments(__VA_ARGS__))
-#define vkCmdFillBuffer(...) (::mkwvk::note_work(), ::vkx::vkCmdFillBuffer(__VA_ARGS__))
-#define vkCmdUpdateBuffer(...) (::mkwvk::note_work(), ::vkx::vkCmdUpdateBuffer(__VA_ARGS__))
+#define vkCmdFillBuffer(...) ([](const auto&... a_) { ::mkwvk::note_work(), ::mkwvk::note_producer(a_...); return ::vkx::vkCmdFillBuffer(a_...); }(__VA_ARGS__))
+#define vkCmdUpdateBuffer(...) ([](const auto&... a_) { ::mkwvk::note_work(), ::mkwvk::note_producer(a_...); return ::vkx::vkCmdUpdateBuffer(a_...); }(__VA_ARGS__))
 #define vkCmdBeginQuery(...) (::mkwvk::note_work(), ::vkx::vkCmdBeginQuery(__VA_ARGS__))
 #define vkCmdEndQuery(...) (::mkwvk::note_work(), ::vkx::vkCmdEndQuery(__VA_ARGS__))

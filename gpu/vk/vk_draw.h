@@ -46,6 +46,13 @@ struct DrawArgs {
 
 /// A recording starts (its slot's descriptor pool and upload stream are reset); value: the timeline value it signals
 void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value);
+/// (local, meshsync, RX_VK_MESH_HOIST) A mesh draw comes next and the command buffer's hoist window is closed by a write since its start:
+/// the replay begins another command buffer of the recording first (vk_replay.cpp hoist_split), so its fallback compute can be hoisted
+bool draw_hoist_wants_split();
+/// The recording goes on in another command buffer (nothing bound there, no pass open)
+void draw_cmd_switched(VkCommandBuffer cmd);
+/// The hoisted compute's last command buffer ends: what it wrote, ordered before the window's commands
+void draw_pre_finish(VkCommandBuffer last);
 /// The recording's stream still holds [at, at + n) in the mapping at base (a reset starts used over)
 bool stream_holds(const uint8_t* base, uint64_t at, uint64_t n);
 /// The open render pass ends (before transfers, clears, barriers and the recording's end)

@@ -47,6 +47,7 @@
 #include "shaders/clear_vert_spv.h"
 #include "shaders/taau_upscale_comp_spv.h"
 #include "shaders/movie_upscale_comp_spv.h"
+#include "shaders/mesh_prep_comp_spv.h"   // (local, meshsync)
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
@@ -388,6 +389,13 @@ void stats_note_bind(uint64_t prog, int stage, uint64_t addr, uint64_t size, boo
 /// The recording being built (each recording thread's own)
 thread_local VkCommandBuffer rec_cmd = VK_NULL_HANDLE;
 thread_local uint64_t rec_value = 0;
+// (local, meshsync) RX_VK_MESH_HOIST: the command buffers begun for the recording since its start (hoist windows: draw_cmd_switched), and
+// whether the fallback arena ran out in it (no more windows begun for nothing). RX_VK_MESH_NARROW: tl_work_n when a fallback draw ended the
+// pass only for its compute (begin_pass then opens the same targets again without the pass-start barrier)
+thread_local int hoist_windows = 0;
+thread_local bool hoist_starved = false;
+thread_local uint64_t pass_resume_at = ~0ull;
+thread_local bool mesh_convert_late = false;   // (draw(): the indirect mesh draw's conversion left to fallback_record)
 
 // ---- per recording: a descriptor pool and an upload stream (reset when the recording is reused) ----
 struct RecordingRes {
@@ -3175,16 +3183,18 @@ bool targets_persistent(const Targets& at) {
 }
 
 void begin_pass(VkCommandBuffer cmd, const Targets& at) {
-    bool same = pass().open && pass().depth == at.depth_view && pass().n == at.n && pass().width == at.width &&
-                pass().height == at.height;
+    bool same = pass().depth == at.depth_view && pass().n == at.n && pass().width == at.width && pass().height == at.height;
     for (int i = 0; i < at.n && same; i++) same = pass().color[i] == at.color_view[i];
-    if (same) return;
+    if (same && pass().open) return;
+    // (local, meshsync, RX_VK_MESH_NARROW) the pass a fallback draw ended for its compute, nothing recorded since but that compute
+    const bool resume = same && pass_resume_at == tl_work_n;
+    pass_resume_at = ~0ull;
     end_pass(cmd);
     // (what the pass before wrote, and the transfers before it. RX_VK_BARRIER_NARROW: narrow when every attachment is a texture
     // radv keeps L2-coherent on GFX9, so the pass's RB reads them through L2 as its shaders read the rest)
     bool l2_ok = !at.depth_view || attachment_l2_coherent(at.depth);
     for (int i = 0; i < at.n && l2_ok; i++) l2_ok = !at.color_view[i] || attachment_l2_coherent(at.color[i]);
-    consumer_barrier(cmd, "barrier (pass start)", "barrier (pass start, narrow)", l2_ok);
+    if (!resume) consumer_barrier(cmd, "barrier (pass start)", "barrier (pass start, narrow)", l2_ok);
     work_since_barrier = true;
     VkRenderingAttachmentInfo ca[8]{};
     bool marks = !texture_marked(at.depth);
@@ -3796,6 +3806,15 @@ void clear_stats(int64_t* clears, int64_t* masked) {
 namespace {
 } // namespace
 
+/// A command buffer begun: nothing bound on it, no pass open (local, meshsync: also a hoist window's start)
+static void cmd_state_fresh(VkCommandBuffer cmd) {
+    pass() = Pass{};
+    work_since_barrier = false;
+    last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
+    vertex_set.on = false, last_ib.on = false;
+    descriptors_disturbed();
+    hoist_watch_cmd = cmd, hoist_blocked = false, pass_resume_at = ~0ull;
+}
 void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     rec_cmd = cmd;
     rec_value = value;
@@ -3841,11 +3860,8 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     r.used = 0, r.before = 0;
     r.c1_at.clear();
     cur = &r;
-    pass() = Pass{};
-    work_since_barrier = false;
-    last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
-    vertex_set.on = false, last_ib.on = false;
-    descriptors_disturbed();
+    cmd_state_fresh(cmd);
+    hoist_windows = 0, hoist_starved = false;
     static thread_local uint64_t hits_value = ~0ull;   // (resolved targets last a submission, through its parts: no CPU write is
     if (value != hits_value) {            // collected between them; resolved handles last while their slot and
         hits_value = value;               // texture do, and are touched again once a submission)
@@ -5114,7 +5130,165 @@ bool fallback_compute_pipelines(Program& p) {
     return true;
 }
 
-/// The dispatches of a mesh draw, outside any render pass, and the vertex count its graphics draw then covers.
+// ---- (local, meshsync) the fallback's per-draw synchronisation: hc flags RX_VK_MESH_ARENA, RX_VK_MESH_NARROW, RX_VK_MESH_HOIST (default
+// off: as before). Per draw the old path ends the pass and records 3-4 full barriers (each a drain of the whole GPU, L2 written back and
+// emptied, CB/DB flushed), plus the pass-start barrier when the pass opens again. ----
+/// RADV on a GFX9 GPU (Vega, Raven, Renoir: Cezanne reports RENOIR). Shaders, the CP's indirect reads and vertex fetch all read through
+/// L2 there: radv_src_access_flush writes back and empties L2 for any buffer write access of a barrier, which those readers do not
+/// need (radv_dst_access_flush leaves INV_L2 out for them). Same test as vk_texture.cpp's RX_VK_BARRIER_NARROW
+bool gpu_radv_gfx9() {
+    static const bool on = [] {
+        VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &dp;
+        if (dev.physical) vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        const char* n = p2.properties.deviceName;
+        return dp.driverID == VK_DRIVER_ID_MESA_RADV && (strstr(n, "VEGA") || strstr(n, "RAVEN") || strstr(n, "RENOIR"));
+    }();
+    return on;
+}
+/// A barrier scoped to the stages named: src's writes (or, from vertex or indirect stages, reads that later writes must wait for) before
+/// dst's reads and writes. No fragment or transfer stage in src: RADV then drains only compute (and vertex) work, not the pass's pixels
+void mesh_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst) {
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = src, b.dstStageMask = dst;
+    if (!gpu_radv_gfx9()) {
+        if (src & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) b.srcAccessMask |= VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        if (src & VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT) b.srcAccessMask |= VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    }
+    if (dst & (VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT))
+        b.dstAccessMask |= VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    if (dst & VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT) b.dstAccessMask |= VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+    if (dst & VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT) b.dstAccessMask |= VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
+    if (dst & VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT) b.dstAccessMask |= VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1, di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+}
+constexpr VkPipelineStageFlags2 kMeshC = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+constexpr VkPipelineStageFlags2 kMeshCI = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+constexpr VkPipelineStageFlags2 kMeshDraw = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+                                            VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+
+/// shaders/mesh_prep.comp: one draw's few words written by a compute dispatch, not by fills and a copy (a transfer before a barrier
+/// makes RADV wait for the pass's pixels as well: radv_stage_flush adds PS_PARTIAL_FLUSH for any transfer stage)
+struct MeshPrep {
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+};
+const MeshPrep& mesh_prep() {
+    static const MeshPrep m = [] {
+        MeshPrep r;
+        if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR) return r;
+        const VkDescriptorSetLayoutBinding bind{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        li.bindingCount = 1, li.pBindings = &bind;
+        VkDescriptorSetLayout set{};
+        if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &set) != VK_SUCCESS) return r;
+        const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+        VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pi.setLayoutCount = 1, pi.pSetLayouts = &set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+        if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &r.layout) != VK_SUCCESS) return MeshPrep{};
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = sizeof MESH_PREP_COMP_SPV, mi.pCode = MESH_PREP_COMP_SPV;
+        VkShaderModule mod{};
+        if (vkCreateShaderModule(dev.device, &mi, nullptr, &mod) != VK_SUCCESS) return MeshPrep{};
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, mod, "main", nullptr};
+        ci.layout = r.layout;
+        if (vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &r.pipe) != VK_SUCCESS) r.pipe = VK_NULL_HANDLE;
+        vkDestroyShaderModule(dev.device, mod, nullptr);
+        logf("vk: mesh fallback prep pipeline (RX_VK_MESH_NARROW / HOIST): %s", r.pipe ? "made" : "FAILED, the old fills are used");
+        return r;
+    }();
+    return m;
+}
+/// The records' header {0, 1, 0, 0, 0} at records, the lean mesh dispatch's {0, 1, 1} at lean, args' count word as {count, 1, 1} at conv
+/// (each 0: left out). dummy: any storage buffer, bound when there are no args (the shader names the binding)
+void mesh_prep_record(VkCommandBuffer cmd, uint64_t records, uint64_t lean, uint64_t conv, const BufferRef* args, uint32_t word,
+                      VkBuffer dummy) {
+    const MeshPrep& m = mesh_prep();
+    struct { uint64_t records, lean, conv; uint32_t word, flags; } pc{records, lean, conv, 0, 0};
+    VkDescriptorBufferInfo bi{dummy, 0, 16};
+    if (args && conv) {   // (a storage buffer's offset aligned to 256, the most minStorageBufferOffsetAlignment can be)
+        const uint64_t at = args->offset & ~255ull;
+        bi = {args->buffer, at, args->offset - at + 4ull * (word + 1)};
+        pc.word = (uint32_t)((args->offset - at) / 4) + word;
+    }
+    pc.flags = (records ? 1u : 0u) | (lean ? 2u : 0u) | (args && conv ? 4u : 0u);
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstBinding = 0, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, w.pBufferInfo = &bi;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m.pipe);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m.layout, 0, 1, &w);
+    vkCmdPushConstants(cmd, m.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(cmd, 1, 1, 1);
+    descriptors_disturbed();   // (another layout pushed at the compute bind point)
+}
+
+/// RX_VK_MESH_ARENA / HOIST: each draw's records, payload and converted task count in a region of its own, from chunks of a shared
+/// arena. A chunk is taken by one recording thread at a time and used again once the GPU has passed the newest submission that used
+/// it (the recordings' timeline). RX_VK_FB_ARENA_MB=<n> (default 1024): the most all chunks may take; past it the draw takes the
+/// shared buffers, as before. A region is as large as the draw could ever write (capacity x vertices a workgroup x record words for an
+/// indirect draw): 10-25 MB for OoT's level programs at capacity 2048
+struct ArenaChunk {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation mem = nullptr;
+    uint64_t address = 0, size = 0, used = 0, value = 0;   // (value: the newest submission that used it)
+    bool held = false;                                     // (a thread's current chunk; arena_mu)
+};
+std::mutex arena_mu;
+std::vector<std::unique_ptr<ArenaChunk>> arena_chunks;   // (arena_mu)
+uint64_t arena_bytes = 0;                                // (arena_mu)
+thread_local ArenaChunk* arena_cur = nullptr;
+struct Region {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    uint64_t address = 0;
+    Region at(uint64_t n) const { return {buffer, offset + n, address + n}; }
+};
+bool arena_take(uint64_t n, Region& out) {
+    if (!rec_value) return false;   // (a recording the timeline does not mark done)
+    n = (n + 255) & ~255ull;
+    if (!arena_cur || arena_cur->used + n > arena_cur->size) {
+        static const uint64_t budget = (getenv("RX_VK_FB_ARENA_MB") ? strtoull(getenv("RX_VK_FB_ARENA_MB"), nullptr, 0) : 1024ull) << 20;
+        std::lock_guard lk(arena_mu);
+        if (arena_cur) arena_cur->held = false;
+        arena_cur = nullptr;
+        const uint64_t done = vk_timeline_completed();
+        for (auto& c : arena_chunks)
+            if (!c->held && c->value <= done && c->size >= n) { arena_cur = c.get(); break; }
+        if (!arena_cur) {
+            const uint64_t size = std::max<uint64_t>(128ull << 20, n);
+            if (arena_bytes + size > budget) {
+                static int told;
+                if (told++ < 4) logf("vk: mesh arena full (%llu MB, RX_VK_FB_ARENA_MB): fallback draws take the shared buffers", (unsigned long long)(arena_bytes >> 20));
+                return false;
+            }
+            auto c = std::make_unique<ArenaChunk>();
+            void* mapped = nullptr;
+            const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+            if (!create_buffer(size, usage, false, c->buffer, c->mem, &mapped)) return false;
+            c->address = fallback_buffer_address(c->buffer);
+            if (!c->address) return false;
+            c->size = size;
+            arena_bytes += size;
+            static int told;
+            if (told++ < 16) logf("vk: mesh arena: a chunk of %llu MB made, %llu MB in all", (unsigned long long)(size >> 20), (unsigned long long)(arena_bytes >> 20));
+            arena_cur = c.get();
+            arena_chunks.push_back(std::move(c));
+        }
+        arena_cur->held = true, arena_cur->used = 0;
+    }
+    out = {arena_cur->buffer, arena_cur->used, arena_cur->address + arena_cur->used};
+    arena_cur->used += n;
+    arena_cur->value = std::max(arena_cur->value, rec_value);
+    return true;
+}
+thread_local SharedFallback shared_conv;   // (RX_VK_MESH_NARROW without a region: the converted task count, 12 bytes)
+
+/// The dispatches of a mesh draw, outside any render pass (or, local meshsync RX_VK_MESH_HOIST, in the hoist command buffers), and the vertex count its graphics draw then covers.
 bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     if (d.count_addr) {   // (more than one draw in the records: each its own dispatch, not one)
         static std::atomic<int> told{0};
@@ -5137,10 +5311,11 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     }
     FallbackBuffers* f = nullptr;
     if (!fallback_buffers_of(p, f) || !fallback_compute_pipelines(p)) return false;
-    fallback_payload_address = f->payload_address;
-    fallback_records_address = f->records_address;
     const uint32_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
     const bool lean{fallback_lean() && p.fallback_task && f->payload};
+    // (local, meshsync) RX_VK_MESH_ARENA / NARROW / HOIST (hc flags), see below. While any is on, RING is off (both move the header)
+    const bool arena_on = hc_flag[HC_MESH_ARENA] != 0, narrow = hc_flag[HC_MESH_NARROW] != 0;
+    const bool sync_on{arena_on || narrow || hc_flag[HC_MESH_HOIST]};
     // (local, mesh-play) RX_VK_MESH_RING=1 (hc flag; with RX_VK_MESH_LEAN): each draw's header words (the draw's indirect args 0-4,
     // the mesh dispatch's 5-7) are its own 32 bytes of a 64-slot ring at the records buffer's start, its records base moved by as
     // much; the ring is set up with one update and two barriers every 64 draws (or a new command buffer / buffer), instead of
@@ -5149,7 +5324,7 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     thread_local uint32_t ring_at = 64;
     thread_local VkCommandBuffer ring_cmd = VK_NULL_HANDLE;
     thread_local VkBuffer ring_buf = VK_NULL_HANDLE;
-    const bool ring{hc_flag[HC_MESH_RING] && fallback_lean() && (lean || !p.fallback_task)};
+    const bool ring{hc_flag[HC_MESH_RING] && !sync_on && fallback_lean() && (lean || !p.fallback_task)};
     if (ring && (ring_at >= 64 || ring_cmd != cmd || ring_buf != f->records)) {
         static const std::vector<uint32_t> heads = [] {
             std::vector<uint32_t> v(64 * 8, 0);
@@ -5164,10 +5339,8 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     }
     if (!ring) ring_at = 64;   // (the plain path below writes slot 0's bytes: set the ring up again when it comes back on)
     const VkDeviceSize head = ring ? (VkDeviceSize)ring_at++ * 32 : 0;
-    fallback_records_address = f->records_address + head;
-    fallback_head = head;
+    fallback_head = 0;
     fallback_indirect = VK_NULL_HANDLE;
-    const bool indirect{d.indirect && mesh_conv_buf != VK_NULL_HANDLE};
     const uint32_t groups{(uint32_t)std::clamp(d.groups[0], 0, (int)capacity)};
     // (a task workgroup's slots are wg * threads + thread: those past the buffer are not started)
     // (local, missgeo-b) An indirect draw's task workgroup count is on the GPU, and its groups[0] is 0: it ran its task
@@ -5187,83 +5360,177 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
             logf("vk: fallback: %016llx draws %llu mesh workgroups, %u fit (issue 640): the rest left out",
                  (unsigned long long)p.key, (unsigned long long)want, capacity);
     }
-    end_pass(cmd);
-    if (ring) {
-        if (!p.fallback_task) full_barrier(cmd);   // (the mesh dispatch writes the records the last draw read)
-    } else {
-    full_barrier(cmd);   // (local: the last fallback draw read these buffers; shared now, so before they are cleared)
-    if (fallback_compact()) {   // (local: words 0-3 the indirect draw's {0 vertices, 1 instance, 0, 0}; the slot counts are
-        // not used. Fills that do not overlap: two to the same bytes would race, with no barrier between them)
-        vkCmdFillBuffer(cmd, f->records, 0, 4, 0);
-        vkCmdFillBuffer(cmd, f->records, 4, 4, 1);
-        vkCmdFillBuffer(cmd, f->records, 8, 8, 0);
-        // (local, meshfast: RX_VK_MESH_INDEXED draws indexed from words 0-4 {indices, 1, 0, 0, 0}; the indices from word capacity)
-        if (p.fallback_indexed) vkCmdFillBuffer(cmd, f->records, 16, 4, 0);
-    } else {
-        vkCmdFillBuffer(cmd, f->records, 0, (VkDeviceSize)capacity * 4, 0);   // (the slots this draw runs)
-    }
-    // (the payloads too: a mesh workgroup the task did not start still runs, and reads its payload's words)
-    if (lean) {   // (local, mesh-play: only the mesh dispatch's args {0, 1, 1} at records words 5-7; no slot runs that no task wrote)
-        vkCmdFillBuffer(cmd, f->records, 20, 4, 0);
-        vkCmdFillBuffer(cmd, f->records, 24, 8, 1);
-    } else if (f->payload && fallback_fill_used()) {   // (local: only the slots the mesh dispatch below reads, [0, slots))
-        if (slots) {
-            vkCmdFillBuffer(cmd, f->payload, 0, (VkDeviceSize)slots * 4, 0);
-            if (p.fallback_payload_words)
-                vkCmdFillBuffer(cmd, f->payload, (VkDeviceSize)capacity * 4,
-                                (VkDeviceSize)slots * p.fallback_payload_words * 4, 0);
+    // (local, meshsync) Which path. small: the draw's only cleared words are the records' header and the lean dispatch's args (COMPACT,
+    // and LEAN for a task program), so mesh_prep can write them. HOIST: its compute goes to the recording's hoist command buffers, run
+    // before the window's commands, while nothing recorded in the window since its start wrote memory (vk_work.h note_producer);
+    // the pass is not ended. ARENA: a region of its own (no barrier for the last draw's reads of the shared buffers). NARROW: barriers
+    // scoped to the stages, mesh_prep for the small words, the pass begun again without its barrier (RADV GFX9).
+    // The lean dispatch's args are the records' words 5-7 (mesh-ring's layout, shader side too)
+    const bool small{(narrow || hc_flag[HC_MESH_HOIST]) && fallback_compact() && (lean || !p.fallback_task) && mesh_prep().pipe};
+    const bool hoist_want{hc_flag[HC_MESH_HOIST] && small && !hoist_blocked && !dump_on() && !gprof_on() && !probe_on()};
+    static const uint32_t ind_word = getenv("RX_VK_MESH_IND_COUNT_WORD") ? (uint32_t)atoi(getenv("RX_VK_MESH_IND_COUNT_WORD")) & 3 : 0;
+    BufferRef args{};
+    if (d.indirect && small && (hoist_want || narrow)) args = gpu_buffer_bind(d.indirect, 4ull * (ind_word + 1), false);
+    const bool args_ok{!d.indirect || args};
+    Region rec{f->records, head, f->records_address + head}, pay{f->payload, 0, f->payload_address}, conv{};
+    bool own = false, hoist = false;
+    if ((hoist_want && args_ok) || arena_on) {
+        const uint64_t most_slots = p.fallback_task ? slots : d.indirect ? capacity : groups;
+        const uint64_t rec_bytes = ((uint64_t)capacity * 4 + most_slots * p.fallback_vertices_per_workgroup * p.fallback_record_words * 4 + 255) & ~255ull;
+        const uint64_t pay_bytes = p.fallback_task ? (uint64_t)capacity * 4 + (uint64_t)capacity * p.fallback_payload_words * 4 : 0;
+        Region r;
+        if (arena_take(256 + rec_bytes + pay_bytes, r)) {
+            own = true, conv = r, rec = r.at(256);
+            if (p.fallback_task) pay = r.at(256 + rec_bytes);
+        } else {
+            hoist_starved = true;
         }
-    } else if (f->payload) {
-        vkCmdFillBuffer(cmd, f->payload, 0, f->payload_size, 0);
     }
-    full_barrier(cmd);
+    VkCommandBuffer pre[3]{};
+    if (hoist_want && args_ok && own) {
+        const int got = hoist_pre(cmd, pre);
+        hoist = got != 0;
+        if (got == 2) {   // (begun now: after what came before them, then each after the one before it)
+            full_barrier(pre[0], "barrier (mesh hoist start)");
+            mesh_barrier(pre[1], kMeshC, kMeshCI);
+            mesh_barrier(pre[2], kMeshC, kMeshCI);
+        }
     }
-    if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p)) return false;
-    push_constants(cmd, p, nullptr);
+    if (!own && small && narrow && d.indirect && args_ok && shared_fallback(shared_conv, 256))
+        conv = {shared_conv.buffer, 0, shared_conv.address};
+    const bool prep{small && (hoist || narrow) && args_ok && (!d.indirect || conv.buffer)};
+    fallback_payload_address = pay.address;
+    fallback_records_address = rec.address;
+    const VkCommandBuffer c0 = hoist ? pre[0] : cmd, c1 = hoist ? pre[1] : cmd, c2 = hoist ? pre[2] : cmd;
+    const bool was_open = pass().open;
+    if (!hoist) {
+        if (d.indirect && !prep && mesh_convert_late) mesh_indirect_convert(cmd, d);   // (draw() left it: this draw takes the old way)
+        end_pass(cmd);
+        if (ring) {
+            if (!p.fallback_task) full_barrier(cmd);   // (the mesh dispatch writes the records the last draw read)
+        } else if (narrow) {   // (the game's compute writes this draw reads; without a region of its own, also the last fallback draw's reads)
+            mesh_barrier(cmd, kMeshC | (own ? 0 : kMeshDraw), kMeshCI | (prep ? 0 : VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT));
+        } else if (!own) {
+            full_barrier(cmd);   // (local: the last fallback draw read these buffers; shared now, so before they are cleared)
+        }
+    }
+    VkBuffer conv_buf = mesh_conv_buf;   // (an indirect dispatch's {count, 1, 1})
+    VkDeviceSize conv_off = mesh_conv_off;
+    if (prep) {
+        if (d.indirect) conv_buf = conv.buffer, conv_off = conv.offset;
+        mesh_prep_record(c0, rec.address, lean ? rec.address + 20 : 0, d.indirect ? conv.address : 0,
+                         d.indirect ? &args : nullptr, ind_word, rec.buffer);
+        if (!hoist) mesh_barrier(cmd, kMeshC, kMeshCI);
+    } else if (!ring) {
+        if (fallback_compact()) {   // (local: words 0-3 the indirect draw's {0 vertices, 1 instance, 0, 0}; the slot counts are
+            // not used. Fills that do not overlap: two to the same bytes would race, with no barrier between them)
+            vkCmdFillBuffer(cmd, rec.buffer, rec.offset, 4, 0);
+            vkCmdFillBuffer(cmd, rec.buffer, rec.offset + 4, 4, 1);
+            vkCmdFillBuffer(cmd, rec.buffer, rec.offset + 8, 8, 0);
+            // (local, meshfast: RX_VK_MESH_INDEXED draws indexed from words 0-4 {indices, 1, 0, 0, 0}; the indices from word capacity)
+            if (p.fallback_indexed) vkCmdFillBuffer(cmd, rec.buffer, rec.offset + 16, 4, 0);
+        } else {
+            vkCmdFillBuffer(cmd, rec.buffer, rec.offset, (VkDeviceSize)capacity * 4, 0);   // (the slots this draw runs)
+        }
+        // (the payloads too: a mesh workgroup the task did not start still runs, and reads its payload's words)
+        if (lean) {   // (local, mesh-play: only the mesh dispatch's args {0, 1, 1} at records words 5-7; no slot runs that no task wrote)
+            vkCmdFillBuffer(cmd, rec.buffer, rec.offset + 20, 4, 0);
+            vkCmdFillBuffer(cmd, rec.buffer, rec.offset + 24, 8, 1);
+        } else if (f->payload && fallback_fill_used()) {   // (local: only the slots the mesh dispatch below reads, [0, slots))
+            if (slots) {
+                vkCmdFillBuffer(cmd, pay.buffer, pay.offset, (VkDeviceSize)slots * 4, 0);
+                if (p.fallback_payload_words)
+                    vkCmdFillBuffer(cmd, pay.buffer, pay.offset + (VkDeviceSize)capacity * 4,
+                                    (VkDeviceSize)slots * p.fallback_payload_words * 4, 0);
+            }
+        } else if (f->payload) {
+            vkCmdFillBuffer(cmd, pay.buffer, pay.offset, f->payload_size, 0);
+        }
+        if (narrow) mesh_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, kMeshCI);
+        else full_barrier(cmd);
+    }
+    const bool indirect{d.indirect && conv_buf != VK_NULL_HANDLE};
+    auto bind = [&](VkCommandBuffer c) {
+        if (!bind_descriptors(c, VK_PIPELINE_BIND_POINT_COMPUTE, p)) return false;
+        push_constants(c, p, nullptr);
+        return true;
+    };
+    if (!bind(p.fallback_task ? c1 : c2)) return false;
     size_t stages[2] = {p.stages.size(), p.stages.size()};
     for (size_t i = 0; i < p.stages.size(); i++) {
         if (p.stages[i].vk_stage != VK_SHADER_STAGE_COMPUTE_BIT) continue;
         if (stages[0] == p.stages.size()) stages[0] = i;
         else stages[1] = i;
     }
-    auto send = [&](size_t stage, bool mesh_stage) {
+    auto send = [&](VkCommandBuffer c, size_t stage, bool mesh_stage) {
         if (stage >= p.fallback_compute.size() || !p.fallback_compute[stage]) return false;
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.fallback_compute[stage]);
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, p.fallback_compute[stage]);
         if (mesh_stage && lean) {
-            vkCmdDispatchIndirect(cmd, f->records, head + 20);
+            vkCmdDispatchIndirect(c, rec.buffer, rec.offset + 20);
         } else if (mesh_stage && p.fallback_task) {
             if (!slots) return true;
-            vkCmdDispatch(cmd, slots, 1, 1);   // (one workgroup a slot; the task's flags cull those it did not start)
+            vkCmdDispatch(c, slots, 1, 1);   // (one workgroup a slot; the task's flags cull those it did not start)
         } else if (d.indirect) {
             if (!indirect) {
                 static std::atomic<int> told{0};
                 if (told++ < 2) logf("vk: fallback: an indirect mesh draw with no converted arguments is left out");
                 return false;
             }
-            vkCmdDispatchIndirect(cmd, mesh_conv_buf, mesh_conv_off);
+            vkCmdDispatchIndirect(c, conv_buf, conv_off);
         } else {
             const uint32_t most{p.fallback_task ? (uint32_t)std::max(1u, capacity / std::max(1u, p.fallback_task_threads))
                                                 : groups};
             const uint32_t n{mesh_stage ? groups : std::min(groups, most)};
             if (!n) return true;
-            vkCmdDispatch(cmd, n, 1, 1);
+            vkCmdDispatch(c, n, 1, 1);
         }
         return true;
     };
     if (p.fallback_task) {
-        if (!send(stages[0], false)) return false;
-        full_barrier(cmd);
-        if (!send(stages[1], true)) return false;
+        if (!send(c1, stages[0], false)) return false;
+        if (hoist) {
+            if (!bind(c2)) return false;
+        } else if (narrow) {
+            mesh_barrier(cmd, kMeshC, kMeshCI);   // (the task's payload and the lean dispatch's count)
+        } else {
+            full_barrier(cmd);
+        }
+        if (!send(c2, stages[1], true)) return false;
         fallback_vertex_count = (lean ? capacity : slots) * p.fallback_vertices_per_workgroup;
     } else {
-        if (!send(stages[0], true)) return false;
+        if (!send(c2, stages[0], true)) return false;
         fallback_vertex_count = (d.indirect ? capacity : groups) * p.fallback_vertices_per_workgroup;
     }
-    if (fallback_compact() && fallback_vertex_count) fallback_indirect = f->records;   // (local: the GPU's count, at most that)
-    full_barrier(cmd);   // (also makes the count visible to the indirect draw: all commands, memory reads)
+    if (fallback_compact() && fallback_vertex_count)   // (local: the GPU's count, at most that)
+        fallback_indirect = rec.buffer, fallback_head = rec.offset;
+    if (hoist) return true;   // (the hoist command buffers end with a full barrier: draw_pre_finish)
+    if (narrow) {
+        mesh_barrier(cmd, kMeshC, kMeshDraw);   // (the records: the vertex stage's reads, the draw's count)
+        if (was_open && gpu_radv_gfx9()) pass_resume_at = tl_work_n;   // (begin_pass: the same targets again, no pass-start barrier)
+    } else {
+        full_barrier(cmd);   // (also makes the count visible to the indirect draw: all commands, memory reads)
+    }
     return true;
 }
 } // namespace
+
+// (local, meshsync, RX_VK_MESH_HOIST) =1: a closed window is followed by another command buffer at the next mesh draw (at most 16 a
+// recording, none once the arena ran out in it; with RX_VK_MESH_LEAN, where every fallback draw can be hoisted); =2: no new windows, only the
+// draws before the window's first write are hoisted
+bool draw_hoist_wants_split() {
+    return hc_flag[HC_MESH_HOIST] == 1 && dev.mesh_fallback && hoist_blocked && !hoist_starved && hoist_windows < 16 && fallback_lean() &&
+           !dump_on() && !gprof_on() && !probe_on();
+}
+void draw_cmd_switched(VkCommandBuffer cmd) {
+    rec_cmd = cmd;
+    const bool work = work_since_barrier;   // (the work before is still to be ordered before a dispatch: same submission)
+    cmd_state_fresh(cmd);
+    work_since_barrier = work;
+    hoist_windows++;
+}
+void draw_pre_finish(VkCommandBuffer last) {
+    full_barrier(last, "barrier (mesh hoist end)");
+}
 
 /// The vertex streams already bound on this command buffer (a new recording, or a mirror made since, is not)
 bool vertex_set_same(uint64_t stamp, const uint64_t* addr, const uint64_t* size, const uint32_t* stride,
@@ -5370,7 +5637,10 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         static const int no_mesh_early = getenv("RX_VK_NO_MESH") ? atoi(getenv("RX_VK_NO_MESH")) : 0;
         if (no_mesh_early == 1 && d.mesh) return;
     }
-    mesh_indirect_convert(cmd, d);   // (EvilOOT: before the pass opens; sets mesh_conv_buf for the mesh draw below)
+    // (local, meshsync) RX_VK_MESH_NARROW / HOIST: a fallback draw's conversion is fallback_record's (mesh_prep, or this one late)
+    mesh_convert_late = d.mesh && d.indirect && dev.mesh_fallback && (hc_flag[HC_MESH_NARROW] || hc_flag[HC_MESH_HOIST]);
+    if (mesh_convert_late) mesh_conv_buf = VK_NULL_HANDLE;
+    else mesh_indirect_convert(cmd, d);   // (EvilOOT: before the pass opens; sets mesh_conv_buf for the mesh draw below)
     VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     if (!d.mesh && !topology(d.prim, topo)) {
         static int logged[32];

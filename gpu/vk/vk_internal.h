@@ -205,6 +205,9 @@ void memory_note_gpu_write(uint64_t gpu, uint64_t size);
 /// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
 uint64_t vk_timeline_completed();
 void vk_timeline_wait(uint64_t v);
+/// (local, meshsync, RX_VK_MESH_HOIST) The recording this thread records: its three command buffers submitted after its uploads and
+/// before its commands (the window's), begun on first use (cmd: the one being recorded). 0: no recording or not cmd; 1: open already; 2: begun now (their first barriers due)
+int hoist_pre(VkCommandBuffer cmd, VkCommandBuffer* out);
 uint32_t memory_generation();
 /// 1: a page of [guest, guest + size) was written after generation gen; 0: none was
 bool memory_written_since(uint64_t guest, uint64_t size, uint32_t gen);
@@ -269,15 +272,17 @@ void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp
 // HC_SHADOW_MIN_LAYER is RX_VK_SHADOW_MIN_INDICES' second number. RX_VK_HC_SKIP=<key>[,<key>...]: the draws and dispatches of
 // those programs (full 16-hex program keys, as the GPU pass timing names them; at most HC_SKIP_MAX) left out, a frame cost map
 // (the picture changes: a measuring tool). HC_SKIP holds the count, the HC_SKIP_KEY slots each key as two halves, so a bench
-// config copies it with the other flags
+// config copies it with the other flags. (local, meshsync) RX_VK_MESH_ARENA / RX_VK_MESH_NARROW / RX_VK_MESH_HOIST: the mesh fallback's
+// per-draw synchronisation (vk_draw.cpp fallback_record). They start with RX_VK_MESH, so set at launch they are in the program cache's
+// fingerprint (one re-prepare); as live configs (RX_VK_LIVE_CFGS) they are not
 enum HcFlag { HC_DISPATCH_INDEP, HC_BARRIER_NARROW, HC_BARRIER_DEFER, HC_HIT_FRONT, HC_IB_FIRST, HC_TEX_REUSE, HC_PICK_UB_FREE, HC_POOLS_SHARED,
               HC_DRY_MEMO, HC_SPAN_SCAN_LAZY, HC_CHUNK, HC_SHADOW_MIN_INDICES, HC_NO_GAME_AA, HC_SHADOW_LAYERS, HC_SHADOW_HALF,
-              HC_EVENT_FLUSH, HC_SIGNAL_FLUSH, HC_BATCH_IDLE, HC_ORDER_WAKE, HC_SEG_FIRST, HC_SERIAL_HEAD, HC_PIECE_FLUSH, HC_DRY_OVERLAP, HC_MESH_RING, HC_SHADOW_MIN_LAYER, HC_SKIP, HC_SKIP_KEY, HC_SKIP_MAX = 16, HC_COUNT = HC_SKIP_KEY + 2 * HC_SKIP_MAX };
+              HC_EVENT_FLUSH, HC_SIGNAL_FLUSH, HC_BATCH_IDLE, HC_ORDER_WAKE, HC_SEG_FIRST, HC_SERIAL_HEAD, HC_PIECE_FLUSH, HC_DRY_OVERLAP, HC_MESH_RING, HC_MESH_ARENA, HC_MESH_NARROW, HC_MESH_HOIST, HC_SHADOW_MIN_LAYER, HC_SKIP, HC_SKIP_KEY, HC_SKIP_MAX = 16, HC_COUNT = HC_SKIP_KEY + 2 * HC_SKIP_MAX };
 inline const char* const hc_names[HC_COUNT] = {
     "RX_VK_DISPATCH_INDEP", "RX_VK_BARRIER_NARROW", "RX_VK_BARRIER_DEFER", "RX_VK_HIT_FRONT", "RX_VK_IB_FIRST", "RX_VK_TEX_REUSE", "RX_VK_PICK_UB_FREE",
     "RX_VK_POOLS_SHARED", "RX_VK_DRY_MEMO", "RX_VK_SPAN_SCAN_LAZY", "RX_VK_CHUNK", "RX_VK_SHADOW_MIN_INDICES", "RX_VK_NO_GAME_AA",
     "RX_VK_SHADOW_LAYERS", "RX_VK_SHADOW_HALF", "RX_VK_EVENT_FLUSH", "RX_VK_SIGNAL_FLUSH", "RX_VK_BATCH_IDLE", "RX_VK_ORDER_WAKE", "RX_VK_SEG_FIRST",
-    "RX_VK_SERIAL_HEAD", "RX_VK_PIECE_FLUSH", "RX_VK_DRY_OVERLAP", "RX_VK_MESH_RING", nullptr, "RX_VK_HC_SKIP"};
+    "RX_VK_SERIAL_HEAD", "RX_VK_PIECE_FLUSH", "RX_VK_DRY_OVERLAP", "RX_VK_MESH_RING", "RX_VK_MESH_ARENA", "RX_VK_MESH_NARROW", "RX_VK_MESH_HOIST", nullptr, "RX_VK_HC_SKIP"};
 inline int hc_flag[HC_COUNT];    // (ponytail: plain ints, written only while the replay thread benches; atomics if that changes)
 inline int hc_start[HC_COUNT];   // (the startup values)
 /// One switch set as the environment would give it (v null: unset). False: not one of these

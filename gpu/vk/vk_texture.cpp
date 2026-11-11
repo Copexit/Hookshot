@@ -1881,6 +1881,9 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
 
 std::atomic<uint64_t> work_epoch{0};
 thread_local VkCommandBuffer barrier_pending_cmd = VK_NULL_HANDLE;   // (RX_VK_BARRIER_DEFER: the game's barrier not recorded yet)
+thread_local VkCommandBuffer hoist_watch_cmd = VK_NULL_HANDLE;   // (local, meshsync: vk_work.h note_producer, vk_draw.cpp sets it)
+thread_local bool hoist_blocked = false;
+thread_local uint64_t tl_work_n = 0;
 namespace {
 // (each thread's own: the display thread's present records barriers too)
 thread_local VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;   // (the command buffer this thread's last full barrier went into, and the work count then)

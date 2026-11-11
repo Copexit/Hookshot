@@ -1,0 +1,15 @@
+#version 460
+// (local, meshsync) One mesh fallback draw's small words, written by a compute dispatch instead of transfer commands (on RADV a
+// transfer before a barrier makes it wait for the graphics work too): the records' indirect draw header {0, 1, 0, 0, 0} (word 4:
+// meshfast's indexed draw reads five; unused otherwise), the lean
+// mesh dispatch's {0, 1, 1} and an indirect draw's task count as {count, 1, 1} (NVN keeps {count, first}). vk_draw.cpp mesh_prep
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+layout(set = 0, binding = 0, std430) readonly buffer Args { uint a[]; } args;
+layout(push_constant) uniform Push { Words records; Words lean; Words conv; uint word; uint flags; } pc;
+void main() {
+    if ((pc.flags & 1u) != 0u) { pc.records.w[0] = 0u; pc.records.w[1] = 1u; pc.records.w[2] = 0u; pc.records.w[3] = 0u; pc.records.w[4] = 0u; }
+    if ((pc.flags & 2u) != 0u) { pc.lean.w[0] = 0u; pc.lean.w[1] = 1u; pc.lean.w[2] = 1u; }
+    if ((pc.flags & 4u) != 0u) { pc.conv.w[0] = args.a[pc.word]; pc.conv.w[1] = 1u; pc.conv.w[2] = 1u; }
+}
