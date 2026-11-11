@@ -27,6 +27,7 @@
 #include "shaders/fg_luma_comp_spv.h"
 #include "shaders/fg_median_comp_spv.h"
 #include "shaders/fg_scale_comp_spv.h"
+#include "shaders/fg_scale_fast_comp_spv.h"
 #include "shaders/fg_synth_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
@@ -92,6 +93,7 @@ struct State {
 struct ScaleState {
     bool init = false, failed = false;
     Pipe pipe;
+    Pipe fast;   // (local) RX_VK_FAST_SCALE: fg_scale_fast.comp (null: off or not made, fg_scale.comp's path)
     VkSampler linear = VK_NULL_HANDLE;
     Img cropped, scaled;
     uint32_t cropped_w = 0, cropped_h = 0, scaled_w = 0, scaled_h = 0;
@@ -203,6 +205,13 @@ bool init() {
     return true;
 }
 
+void drop_pipe(Pipe& p) {
+    if (p.pipe) vkDestroyPipeline(dev.device, p.pipe, nullptr);
+    if (p.layout) vkDestroyPipelineLayout(dev.device, p.layout, nullptr);
+    if (p.set) vkDestroyDescriptorSetLayout(dev.device, p.set, nullptr);
+    p = {};
+}
+
 bool init_scale() {
     if (scale.init) return !scale.failed;
     scale.init = scale.failed = true;
@@ -215,13 +224,21 @@ bool init_scale() {
         si.magFilter = si.minFilter = VK_FILTER_LINEAR;
         if (vkCreateSampler(dev.device, &si, nullptr, &scale.linear) == VK_SUCCESS) {
             scale.failed = false;
+            // (local) RX_VK_FAST_SCALE=1 (straight into the swapchain image when it allows storage) or 2 (the fast shader into
+            // the intermediate, for A/B): fg_scale_fast.comp. Its output has no format (the swapchain's BGRA8), which needs
+            // shaderStorageImageWriteWithoutFormat; without it, fg_scale.comp as before
+            const int fast = getenv("RX_VK_FAST_SCALE") ? atoi(getenv("RX_VK_FAST_SCALE")) : 0;
+            if (fast && !(dev.features.shaderStorageImageWriteWithoutFormat &&
+                          make_pipe(scale.fast, FG_SCALE_FAST_COMP_SPV, sizeof FG_SCALE_FAST_COMP_SPV, {S, I}, 40)))
+                drop_pipe(scale.fast);
+            if (fast)
+                logf("vk: fast window scaling (RX_VK_FAST_SCALE=%d): %s", fast,
+                     scale.fast.pipe ? (dev.swap_storage ? "into the swapchain image" : "into an intermediate (the swapchain has no storage)")
+                                     : "not available (no storage writes without format): the filter as before");
             return true;
         }
     }
-    if (scale.pipe.pipe) vkDestroyPipeline(dev.device, scale.pipe.pipe, nullptr);
-    if (scale.pipe.layout) vkDestroyPipelineLayout(dev.device, scale.pipe.layout, nullptr);
-    if (scale.pipe.set) vkDestroyDescriptorSetLayout(dev.device, scale.pipe.set, nullptr);
-    scale.pipe = {};
+    drop_pipe(scale.pipe);
     return false;
 }
 
@@ -247,12 +264,15 @@ void drop_img(Img& i) {
     i = {};
 }
 
-void to_general(VkCommandBuffer cmd, VkImage image) {
+// ((local) from and to: the swapchain image into GENERAL for fg_scale_fast.comp's writes and back, the writes before made visible)
+void to_general(VkCommandBuffer cmd, VkImage image, VkImageLayout from = VK_IMAGE_LAYOUT_UNDEFINED,
+                VkImageLayout to = VK_IMAGE_LAYOUT_GENERAL) {
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    if (from != VK_IMAGE_LAYOUT_UNDEFINED) b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
     b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.oldLayout = from;
+    b.newLayout = to;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = image;
     b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -303,6 +323,24 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
         for (Img& t : set.frame)
             if (t.image) to_general(cmd, t.image);   // (only the multiplier's frames are made: a barrier on no image crashed the driver)
     fg.have_prev = false;
+    return true;
+}
+
+/// The Window scaling filter's intermediate, dw x dh, GENERAL ((local) out of framegen_scale, for both its paths)
+bool ensure_scaled(VkCommandBuffer cmd, uint32_t dw, uint32_t dh) {
+    if (scale.scaled_w == dw && scale.scaled_h == dh) return true;
+    {
+        std::lock_guard qk(dev.present_mu);   // (the queue is idle only while nothing else submits to it)
+        device_wait_idle_locked();
+    }
+    drop_img(scale.scaled);
+    scale.scaled_w = scale.scaled_h = 0;
+    if (!make_img(scale.scaled, dw, dh, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        drop_img(scale.scaled);
+        return false;
+    }
+    scale.scaled_w = dw, scale.scaled_h = dh;
+    to_general(cmd, scale.scaled.image);
     return true;
 }
 
@@ -418,12 +456,36 @@ bool framegen_on() {
     return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed;
 }
 
-VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {
+VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh,
+                       VkImage direct, VkImageView direct_view, int dx, int dy) {
     if (!opts.upscale && !opts.sharpness) return VK_NULL_HANDLE;
     if (!src || !image || !sw || !sh || !dw || !dh) return VK_NULL_HANDLE;
     if (crop && crop[2] > 0 && crop[3] > 0 &&
         (crop[0] < 0 || crop[1] < 0 || (uint32_t)crop[0] >= sw || (uint32_t)crop[1] >= sh)) return VK_NULL_HANDLE;
     if (!init_scale()) return VK_NULL_HANDLE;
+    // (local) RX_VK_FAST_SCALE: fg_scale_fast.comp reads the crop from the window texture itself and, given the swapchain
+    // image (direct, TRANSFER_DST, a storage view), writes the picture's rectangle (dx, dy, dw x dh) into it: no cropped
+    // copy, no 4K intermediate written and blitted again
+    const bool fast = scale.fast.pipe != VK_NULL_HANDLE, to_swap = fast && direct && direct_view;
+    if (fast) {
+        int c[4] = {0, 0, (int)sw, (int)sh};
+        if (crop && crop[2] > 0 && crop[3] > 0)
+            c[0] = crop[0], c[1] = crop[1], c[2] = std::min(crop[2], (int)sw - crop[0]), c[3] = std::min(crop[3], (int)sh - crop[1]);
+        if (!to_swap && !ensure_scaled(cmd, dw, dh)) return VK_NULL_HANDLE;
+        const struct { int mode; float sharp; int32_t crop[4], at[2], size[2]; } pc{
+            opts.upscale, opts.sharpness / 100.0f, {c[0], c[1], c[2], c[3]}, {to_swap ? dx : 0, to_swap ? dy : 0}, {(int)dw, (int)dh}};
+        if (to_swap) to_general(cmd, direct, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+        pass(cmd, scale.fast, {{src, scale.linear}, {to_swap ? direct_view : scale.scaled.view, VK_NULL_HANDLE}}, dw, dh, &pc, sizeof pc);
+        if (to_swap) to_general(cmd, direct, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        static bool reported = false;
+        if (!reported && getenv("RX_VK_UPSCALE_LOG")) {
+            reported = true;
+            logf("vk: fast upscale dispatched: mode %d, sharpness %d%%, crop %d,%d %dx%d of %ux%u, destination %ux%u at %d,%d (%s)",
+                 opts.upscale, opts.sharpness, c[0], c[1], c[2], c[3], sw, sh, dw, dh, pc.at[0], pc.at[1],
+                 to_swap ? "the swapchain image" : "intermediate");
+        }
+        return to_swap ? direct : scale.scaled.image;
+    }
     // (the game draws into part of its window textures, 2048 x 1152 of 2560 x 1440 here: the filter was given the whole texture, and the
     // picture came out in the top left corner of the window with black around it. The crop first, then the filter)
     if (crop && crop[2] > 0 && crop[3] > 0 && (crop[0] || crop[1] || (uint32_t)crop[2] < sw || (uint32_t)crop[3] < sh)) {
@@ -451,20 +513,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         full_barrier(cmd);
         src = scale.cropped.view;
     }
-    if (scale.scaled_w != dw || scale.scaled_h != dh) {
-        {
-            std::lock_guard qk(dev.present_mu);   // (the queue is idle only while nothing else submits to it)
-            device_wait_idle_locked();
-        }
-        drop_img(scale.scaled);
-        scale.scaled_w = scale.scaled_h = 0;
-        if (!make_img(scale.scaled, dw, dh, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
-            drop_img(scale.scaled);
-            return VK_NULL_HANDLE;
-        }
-        scale.scaled_w = dw, scale.scaled_h = dh;
-        to_general(cmd, scale.scaled.image);
-    }
+    if (!ensure_scaled(cmd, dw, dh)) return VK_NULL_HANDLE;
     const struct { int mode; float sharp; } pc{opts.upscale, opts.sharpness / 100.0f};
     pass(cmd, scale.pipe, {{src, scale.linear}, {scale.scaled.view, VK_NULL_HANDLE}}, dw, dh, &pc, sizeof pc);
     static const bool report = getenv("RX_VK_UPSCALE_LOG") != nullptr;

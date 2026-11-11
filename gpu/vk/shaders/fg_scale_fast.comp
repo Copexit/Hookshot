@@ -1,0 +1,78 @@
+#version 450
+// (local) RX_VK_FAST_SCALE: fg_scale.comp's Window scaling filter and Sharpness at a fraction of its cost at 4K.
+//  - Catmull-Rom / Lanczos 2 as five bilinear taps (the 4x4 kernel's middle 2x2 of each row and column folded into one
+//    bilinear tap, both weights there being positive; the four corner taps, under 0.6% of the weight, left out and the
+//    rest renormalized): 5 taps, the 8 weights as polynomials, not 16 texel fetches and 32 kernel evaluations.
+//  - the crop read straight from the window texture (taps clamped inside it): no cropped copy first.
+//  - the output written straight into the swapchain image when it allows storage (dst_at: the picture's rectangle in it),
+//    else into fg_scale.comp's intermediate: dst has no format, so a BGRA8 swapchain image takes it as it is.
+// The sharpen is fg_scale.comp's, the same four neighbours one picture pixel away.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1) uniform writeonly image2D dst;
+layout(push_constant) uniform P {
+    int mode;
+    float sharp;
+    ivec2 crop_at, crop_size;   // (the picture in src, in texels)
+    ivec2 dst_at, dst_size;     // (its rectangle in dst)
+} pc;
+const float PI = 3.14159265;
+float lanczos2(float x) {
+    x = abs(x);
+    if (x < 1e-4) return 1.0;
+    if (x >= 2.0) return 0.0;
+    const float p = PI * x;
+    return 2.0 * sin(p) * sin(p * 0.5) / (p * p);
+}
+// the kernel's weights for the texels at -1, 0, 1, 2 from the one below the sample point, f the point's fraction past it
+vec4 weights(float f) {
+    if (pc.mode == 2) {
+        const vec4 w = vec4(lanczos2(1.0 + f), lanczos2(f), lanczos2(1.0 - f), lanczos2(2.0 - f));
+        return w / (w.x + w.y + w.z + w.w);
+    }
+    return vec4(f * (-0.5 + f * (1.0 - 0.5 * f)), 1.0 + f * f * (-2.5 + 1.5 * f), f * (0.5 + f * (2.0 - 1.5 * f)),
+                f * f * (-0.5 + 0.5 * f));   // (Catmull-Rom at 1 + f, f, 1 - f, 2 - f; they add up to 1)
+}
+vec2 lo, hi, texel;
+vec3 tap(vec2 t) {   // (t in texels, centres at .5, held inside the crop: its edge pixels repeat, as the cropped copy's did)
+    return textureLod(src, clamp(t, lo, hi) * texel, 0.0).rgb;
+}
+// fg_scale.comp's sharpen(), unchanged
+const float kMaxLobe = 0.25 - 1.0 / 16.0;
+vec3 sharpen(vec3 c, vec3 n, vec3 s, vec3 w, vec3 e, float amount) {
+    const vec3 lo4 = min(min(n, s), min(w, e)), hi4 = max(max(n, s), max(w, e));
+    const vec3 lo = min(lo4, c), hi = max(hi4, c);
+    const vec3 to_black = lo / max(4.0 * hi, vec3(1.0 / 1024.0));
+    const vec3 to_white = (1.0 - hi) / max(4.0 - 4.0 * lo4, vec3(1.0 / 1024.0));
+    const vec3 room = min(to_black, to_white);
+    const float lobe = -clamp(min(min(room.r, room.g), room.b), 0.0, kMaxLobe) * clamp(amount, 0.0, 1.0);
+    const vec3 sharp = (c + lobe * (n + s + w + e)) / (1.0 + 4.0 * lobe);
+    return clamp(sharp, lo, hi);
+}
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, pc.dst_size))) return;
+    texel = 1.0 / vec2(textureSize(src, 0));
+    lo = vec2(pc.crop_at) + 0.5;
+    hi = vec2(pc.crop_at + pc.crop_size) - 0.5;
+    const vec2 scale = vec2(pc.crop_size) / vec2(pc.dst_size);
+    const vec2 p = vec2(pc.crop_at) + (vec2(g) + 0.5) * scale;
+    vec3 c;
+    if (pc.mode == 0) {
+        c = tap(p);
+    } else {
+        const vec2 q = p - 0.5, b = floor(q), f = q - b;
+        const vec4 wx = weights(f.x), wy = weights(f.y);
+        const vec2 w12 = vec2(wx.y + wx.z, wy.y + wy.z);
+        const vec2 t0 = b - 0.5, t12 = b + 0.5 + vec2(wx.z, wy.z) / w12, t3 = b + 2.5;
+        c = tap(vec2(t12.x, t0.y)) * (w12.x * wy.x) + tap(vec2(t0.x, t12.y)) * (wx.x * w12.y) + tap(t12) * (w12.x * w12.y) +
+            tap(vec2(t3.x, t12.y)) * (wx.w * w12.y) + tap(vec2(t12.x, t3.y)) * (w12.x * wy.w);
+        c /= w12.x * (wy.x + w12.y + wy.w) + w12.y * (wx.x + wx.w);
+    }
+    if (pc.sharp > 0.0) {
+        const vec2 e = max(vec2(1.0), scale);   // (one picture pixel, or one window pixel when the window is the smaller)
+        c = sharpen(c, tap(p + vec2(0.0, -e.y)), tap(p + vec2(0.0, e.y)), tap(p + vec2(-e.x, 0.0)), tap(p + vec2(e.x, 0.0)),
+                    pc.sharp);
+    }
+    imageStore(dst, pc.dst_at + g, vec4(c, 1.0));
+}

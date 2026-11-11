@@ -514,6 +514,18 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     // The renderer copies into swapchain images. Readback is optional and only available on surfaces that allow it.
     if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
         ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    // (local) RX_VK_FAST_SCALE=1: the Window scaling filter (fg_scale_fast.comp) writes into the swapchain image itself, no 4K
+    // intermediate written and blitted again (~66 MB of memory traffic a frame at 4K), when the surface allows storage and the
+    // format (BGRA8 on RADV/Wayland) takes storage writes, which have no format in the shader
+    bool storage = false;
+    if (getenv("RX_VK_FAST_SCALE") && atoi(getenv("RX_VK_FAST_SCALE")) == 1 && (caps.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT) &&
+        dev.features.shaderStorageImageWriteWithoutFormat) {
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(dev.physical, fmt.format, &fp);
+        storage = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+        if (storage) ci.imageUsage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        else logf("vk: RX_VK_FAST_SCALE: format %d takes no storage: the filter goes through an intermediate", (int)fmt.format);
+    }
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     if (!(caps.supportedCompositeAlpha & ci.compositeAlpha)) {
@@ -555,6 +567,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     }
     if (dev.swapchain) {
         device_wait_idle_locked();   // (the present queue's presents of the old swapchain done too)
+        for (VkImageView v : dev.swap_views) vkDestroyImageView(dev.device, v, nullptr);   // ((local) before their images go)
         for (auto semaphore : dev.swap_rendered) vkDestroySemaphore(dev.device, semaphore, nullptr);
         vkDestroySwapchainKHR(dev.device, dev.swapchain, nullptr);
     }
@@ -565,6 +578,22 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     vkGetSwapchainImagesKHR(dev.device, sc, &n, nullptr);
     dev.swap_images.resize(n);
     vkGetSwapchainImagesKHR(dev.device, sc, &n, dev.swap_images.data());
+    dev.swap_views.clear();   // ((local) RX_VK_FAST_SCALE=1: a storage view of each; any not made: the intermediate path)
+    dev.swap_storage = false;
+    if (storage) {
+        for (VkImage im : dev.swap_images) {
+            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vi.image = im;
+            vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vi.format = fmt.format;
+            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageView v = VK_NULL_HANDLE;
+            if (vkCreateImageView(dev.device, &vi, nullptr, &v) != VK_SUCCESS) break;
+            dev.swap_views.push_back(v);
+        }
+        dev.swap_storage = dev.swap_views.size() == dev.swap_images.size();
+        logf("vk: swapchain images with storage: %s", dev.swap_storage ? "the window filter writes into them" : "views not made");
+    }
     logf("vk: swapchain %ux%u, %u images, %s", width, height, n,
          mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
     reflex_swapchain_created(sc);   // (NVIDIA Reflex: its sleep mode on the new swapchain)
