@@ -936,6 +936,7 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
         logf("vk: vulkan-1.dll not found");
         return nullptr;
     }
+    hc_init();   // (hillclimb: the switches RX_VK_BENCH_CONFIGS flips, from the environment)
     if (!create_instance() || !pick_device() || !create_device()) return nullptr;
     logf("vk: %s, Vulkan %u.%u, driver %#x; mesh shaders %s, host memory import %s, pipeline libraries %s",
          dev.props.deviceName, VK_VERSION_MAJOR(dev.props.apiVersion), VK_VERSION_MINOR(dev.props.apiVersion),

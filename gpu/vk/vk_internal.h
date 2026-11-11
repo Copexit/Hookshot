@@ -2,6 +2,9 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <array>
 #include <atomic>
 #include <mutex>
@@ -259,6 +262,61 @@ void predict_run(void (*progress)(size_t done, size_t total));   // (after a pre
 void prepare_stop();
 bool prepare_stopped();
 void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp
+
+// (hillclimb) The opt-in switches RX_VK_BENCH_CONFIGS flips between replays of one frame (vk_replay.cpp, bench_frame). Each is
+// read from the environment once, by hc_init at mkwvk_init, with the parsing and default its static had, and is a plain load
+// where it is used. Only bench_frame writes them, between two replays (replay_mu held), and puts the startup values back.
+// HC_SHADOW_MIN_LAYER is RX_VK_SHADOW_MIN_INDICES' second number. RX_VK_HC_SKIP=<key>[,<key>...]: the draws and dispatches of
+// those programs (full 16-hex program keys, as the GPU pass timing names them; at most HC_SKIP_MAX) left out, a frame cost map
+// (the picture changes: a measuring tool). HC_SKIP holds the count, the HC_SKIP_KEY slots each key as two halves, so a bench
+// config copies it with the other flags
+enum HcFlag { HC_DISPATCH_INDEP, HC_BARRIER_NARROW, HC_BARRIER_DEFER, HC_HIT_FRONT, HC_IB_FIRST, HC_TEX_REUSE, HC_PICK_UB_FREE, HC_POOLS_SHARED,
+              HC_DRY_MEMO, HC_SPAN_SCAN_LAZY, HC_CHUNK, HC_SHADOW_MIN_INDICES, HC_NO_GAME_AA, HC_SHADOW_LAYERS, HC_SHADOW_HALF,
+              HC_EVENT_FLUSH, HC_SIGNAL_FLUSH, HC_BATCH_IDLE, HC_ORDER_WAKE, HC_SEG_FIRST, HC_SERIAL_HEAD, HC_PIECE_FLUSH, HC_DRY_OVERLAP, HC_SHADOW_MIN_LAYER, HC_SKIP, HC_SKIP_KEY, HC_SKIP_MAX = 16, HC_COUNT = HC_SKIP_KEY + 2 * HC_SKIP_MAX };
+inline const char* const hc_names[HC_COUNT] = {
+    "RX_VK_DISPATCH_INDEP", "RX_VK_BARRIER_NARROW", "RX_VK_BARRIER_DEFER", "RX_VK_HIT_FRONT", "RX_VK_IB_FIRST", "RX_VK_TEX_REUSE", "RX_VK_PICK_UB_FREE",
+    "RX_VK_POOLS_SHARED", "RX_VK_DRY_MEMO", "RX_VK_SPAN_SCAN_LAZY", "RX_VK_CHUNK", "RX_VK_SHADOW_MIN_INDICES", "RX_VK_NO_GAME_AA",
+    "RX_VK_SHADOW_LAYERS", "RX_VK_SHADOW_HALF", "RX_VK_EVENT_FLUSH", "RX_VK_SIGNAL_FLUSH", "RX_VK_BATCH_IDLE", "RX_VK_ORDER_WAKE", "RX_VK_SEG_FIRST",
+    "RX_VK_SERIAL_HEAD", "RX_VK_PIECE_FLUSH", "RX_VK_DRY_OVERLAP", nullptr, "RX_VK_HC_SKIP"};
+inline int hc_flag[HC_COUNT];    // (ponytail: plain ints, written only while the replay thread benches; atomics if that changes)
+inline int hc_start[HC_COUNT];   // (the startup values)
+/// One switch set as the environment would give it (v null: unset). False: not one of these
+inline bool hc_set(const char* name, const char* v) {
+    for (int i = 0; i < HC_COUNT; i++) {
+        if (!hc_names[i] || strcmp(name, hc_names[i]) != 0) continue;
+        if (i == HC_SHADOW_MIN_INDICES) {
+            int n = 0, l = 0;
+            if (v) sscanf(v, "%d,%d", &n, &l);
+            hc_flag[i] = n, hc_flag[HC_SHADOW_MIN_LAYER] = l;
+        } else if (i == HC_SKIP) {
+            int n = 0;
+            for (const char* q = v ? v : ""; *q && n < HC_SKIP_MAX;) {
+                char* e;
+                const uint64_t k = strtoull(q, &e, 16);
+                if (e > q) hc_flag[HC_SKIP_KEY + 2 * n] = (int)(uint32_t)(k >> 32), hc_flag[HC_SKIP_KEY + 2 * n + 1] = (int)(uint32_t)k, n++;
+                q = *e ? e + 1 : e;
+            }
+            hc_flag[i] = n;
+        } else if (i == HC_SHADOW_LAYERS) {
+            hc_flag[i] = v ? (int)strtoul(v, nullptr, 0) : 0;
+        } else {
+            hc_flag[i] = v ? atoi(v) : i == HC_CHUNK ? 120 : 0;
+        }
+        return true;
+    }
+    return false;
+}
+/// Whether RX_VK_HC_SKIP names this program (callers test hc_flag[HC_SKIP] first: nothing to do by default)
+inline bool hc_skip(uint64_t key) {
+    for (int i = 0; i < hc_flag[HC_SKIP]; i++)
+        if (((uint64_t)(uint32_t)hc_flag[HC_SKIP_KEY + 2 * i] << 32 | (uint32_t)hc_flag[HC_SKIP_KEY + 2 * i + 1]) == key) return true;
+    return false;
+}
+inline void hc_init() {
+    for (int i = 0; i < HC_COUNT; i++)
+        if (hc_names[i]) hc_set(hc_names[i], getenv(hc_names[i]));
+    memcpy(hc_start, hc_flag, sizeof hc_start);
+}
 
 } // namespace mkwvk
 

@@ -242,6 +242,7 @@ void vk_timeline_wait(uint64_t v) {   // (at most 250 ms: a submission held back
 namespace {
 
 int64_t st_wait_ns;   // (time the replay waited for a recording slot: the GPU behind)
+int64_t st_begun, st_slot_waits;   // (local, RX_VK_BENCH's lines: recordings begun, and the ones whose slot wait took over 0.1 ms)
 
 // GPU time: a timestamp at the start and the end of each recording's command buffer, read when its slot comes
 // round again (the work done by then)
@@ -1609,54 +1610,218 @@ void bench_replay(const std::vector<uint64_t>& handles) {
     submit_recording(r, false);
 }
 
+// (hillclimb) RX_VK_BENCH_CONFIGS=<file>: switch configurations replayed in turn, A B C A B C ..., <times> rounds, on the same
+// frame. A line "<name>: RX_VK_X=1 RX_VK_Y=0 ..." (the hc_flag switches, vk_internal.h; those it leaves out keep their startup
+// value, so "base:" is the startup configuration), "#" a comment. Read again at each trigger: a script may change it between
+struct BenchCfg {
+    std::string name;
+    int flag[HC_COUNT];
+};
+std::vector<BenchCfg> bench_configs(const char* path = getenv("RX_VK_BENCH_CONFIGS")) {
+    std::vector<BenchCfg> v;
+    FILE* f = path ? fopen(path, "r") : nullptr;
+    if (!f) {
+        if (path) logf("vk: bench: RX_VK_BENCH_CONFIGS %s not read: the startup configuration alone", path);
+        return v;
+    }
+    char line[2048];
+    while (fgets(line, sizeof line, f)) {
+        char* colon = strchr(line, ':');
+        char* s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == '#' || !colon) continue;
+        char* e = colon;
+        while (e > s && (e[-1] == ' ' || e[-1] == '\t')) e--;
+        BenchCfg c{std::string(s, e), {}};
+        std::memcpy(hc_flag, hc_start, sizeof hc_flag);
+        for (char* t = strtok(colon + 1, " \t\r\n"); t; t = strtok(nullptr, " \t\r\n")) {
+            char* eq = strchr(t, '=');
+            if (eq) *eq = 0;
+            if (!eq || !hc_set(t, eq + 1)) logf("vk: bench cfg %s: %s is not a switch it can flip (left out)", c.name.c_str(), t);
+        }
+        std::memcpy(c.flag, hc_flag, sizeof c.flag);
+        v.push_back(std::move(c));
+    }
+    fclose(f);
+    std::memcpy(hc_flag, hc_start, sizeof hc_flag);
+    return v;
+}
+
+/// (hillclimb) RX_VK_LIVE_CFGS=<configs file, the bench's format> RX_VK_LIVE_GO=<file>: once the file appears, live play cycles
+/// the configs (A B C A B C ...) for RX_VK_LIVE_ROUNDS rounds (default 20), each held RX_VK_LIVE_SECS (default 3) after a settle
+/// of 20 presents, and logs per window "vk: live cfg <name>: <presents> presents in <ms> ms, draws <n>": paired live windows in
+/// one launch (the real pipeline, parallel replay, power sharing), no replays. Startup values restored at the end.
+static void live_cfgs(int64_t presents) {
+    static const char* path = getenv("RX_VK_LIVE_CFGS");
+    if (!path) return;
+    static const char* go = getenv("RX_VK_LIVE_GO");
+    static std::vector<BenchCfg> cfgs;
+    static int rounds = getenv("RX_VK_LIVE_ROUNDS") ? atoi(getenv("RX_VK_LIVE_ROUNDS")) : 20;
+    static const double secs = getenv("RX_VK_LIVE_SECS") ? atof(getenv("RX_VK_LIVE_SECS")) : 3.0;
+    static int state = 0, round = 0;   // (0 waiting, 1 running, 2 done)
+    static size_t c = 0;
+    static int64_t start_p = 0, settle_until = 0, d0 = 0;
+    static std::chrono::steady_clock::time_point t0;
+    if (state == 2) return;
+    if (state == 0) {
+        static int64_t last_look = 0;   // (every 15 presents from the last look: present numbers can skip)
+        if (!go || presents - last_look < 15) return;
+        last_look = presents;
+        if (unlink(go) != 0) return;
+        cfgs = bench_configs(path);
+        if (cfgs.empty()) { state = 2; return; }
+        state = 1, c = 0, round = 0;
+        std::memcpy(hc_flag, cfgs[0].flag, sizeof hc_flag);
+        settle_until = presents + 20, start_p = -1;
+        logf("vk: live: %zu configs, %d rounds of %.1f s", cfgs.size(), rounds, secs);
+        return;
+    }
+    if (start_p < 0) {
+        if (presents < settle_until) return;
+        start_p = presents, t0 = std::chrono::steady_clock::now();
+        int64_t sk = 0, di = 0, pl = 0; d0 = 0; draw_stats(&d0, &sk, &di, &pl);
+        return;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (ms < secs * 1000) return;
+    int64_t d1 = 0, sk = 0, di = 0, pl = 0; draw_stats(&d1, &sk, &di, &pl);
+    const int64_t n = presents - start_p;
+    logf("vk: live cfg %s: %lld presents in %.1f ms, draws %lld (round %d)", cfgs[c].name.c_str(), (long long)n, ms,
+         (long long)(n ? (d1 - d0) / n : 0), round);
+    if (++c == cfgs.size()) c = 0, round++;
+    if (round >= rounds) { std::memcpy(hc_flag, hc_start, sizeof hc_flag); state = 2; logf("vk: live: done"); return; }
+    std::memcpy(hc_flag, cfgs[c].flag, sizeof hc_flag);
+    settle_until = presents + 20, start_p = -1;
+}
+
 void bench_frame(int64_t presents) {
+    live_cfgs(presents);
     static int64_t at = -2;
     static int times = 50;
+    static bool fmode = false;
     if (at == -2) {
         at = -1;
         if (const char* e = getenv("RX_VK_BENCH")) {
             at = atoll(e);
+            if (e[0] == 'f') at = -3, fmode = true;   // (hillclimb: "f,<times>": each time the file RX_VK_BENCH_GO appears, the next frame)
             if (const char* c = strchr(e, ',')) times = std::max(1, atoi(c + 1));
         }
     }
+    static int64_t trig = -1;
+    if (at == -3 || trig >= 0) {
+        static const char* go = getenv("RX_VK_BENCH_GO");
+        if (trig < 0) {
+            static int64_t last_look = 0;
+            if (go && presents - last_look >= 15) { last_look = presents; if (unlink(go) == 0) trig = presents + 2; }
+            return;
+        }
+        if (presents + 1 != trig || frame_submits.empty()) return;
+        at = trig; trig = -1;
+    }
     if (at < 0 || presents + 1 != at || frame_submits.empty()) return;
+    const std::vector<BenchCfg> cfgs = bench_configs();
+    const size_t nc = std::max<size_t>(1, cfgs.size());
+    if (!cfgs.empty())
+        logf("vk: bench: %zu configs, %d rounds, the frame before present %lld (%zu submits)", cfgs.size(), times, (long long)at,
+             frame_submits.size());
     replayed_hold = std::max<uint64_t>(1, frame_first_value - 1);
     int64_t draws0 = 0, sk = 0, di = 0, pl = 0;
     draw_stats(&draws0, &sk, &di, &pl);
-    std::vector<double> ms;
+    std::vector<std::vector<double>> ms(nc), ms_all(nc);
+    std::vector<int64_t> cfg_draws(nc, 0);
     int64_t prof0[PROF_COUNT];
     prof_full++;   // (every phase timed, not one draw in eight: the A/B differences are small)
     std::memcpy(prof0, prof_ns, sizeof prof0);
     const size_t ub_before = ub_updates.size();
+    // (local) each replay's phases apart: their medians and the slot wait's largest (the line above is their means, which one
+    // slow replay moves), and the recordings a replay began (a ring of kRecordings: more than that and it waits on its own parts)
+    std::vector<std::vector<std::vector<double>>> ph(nc, std::vector<std::vector<double>>(PROF_COUNT));
+    const int64_t begun0 = st_begun, waits0 = st_slot_waits;
     queue_flush();
-    for (int i = 0; i < times; i++) {
+    for (int i = 0; i < times; i++)
+        for (size_t c = 0; c < nc; c++) {
+            if (!cfgs.empty()) std::memcpy(hc_flag, cfgs[c].flag, sizeof hc_flag);   // (between replays only: none is half made)
+            vkDeviceWaitIdle(dev.device);
+            ub_updates.resize(ub_before);   // (the last time's uniform updates are written: as if pruned)
+            int64_t pi[PROF_COUNT], d0 = 0, d1 = 0;
+            std::memcpy(pi, prof_ns, sizeof pi);
+            draw_stats(&d0, &sk, &di, &pl);
+            const auto t0 = std::chrono::steady_clock::now();
+            for (const auto& h : frame_submits) bench_replay(h);
+            ms[c].push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            for (int k = 0; k < PROF_COUNT; k++) ph[c][k].push_back((prof_ns[k] - pi[k]) / 1e6);
+            queue_flush();   // (hillclimb: the same replay until the GPU is done = CPU record + GPU tail)
+            vkDeviceWaitIdle(dev.device);
+            ms_all[c].push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            draw_stats(&d1, &sk, &di, &pl);
+            cfg_draws[c] += d1 - d0;
+        }
+    std::memcpy(hc_flag, hc_start, sizeof hc_flag);
+    static const char* names[PROF_COUNT] = {"submit", "present", "draw", "descriptors", "texture lookups", "uploads",
+                                            "pipelines", "programs", "commands", "dispatch", "memory sync",
+                                            "queue submit", "slot wait"};
+    auto median = [](std::vector<double>& v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+    char line[600];
+    if (!cfgs.empty()) {
+        for (size_t c = 0; c < nc; c++) {   // (hillclimb: raw samples in replay order, before the medians sort them: paired tests)
+            for (int w = 0; w < 2; w++) {
+                std::string s = std::string("vk: bench cfg ") + cfgs[c].name + (w ? ": samples all" : ": samples cpu");
+                char b[24];
+                const std::string head = s;
+                for (double v : (w ? ms_all[c] : ms[c])) {
+                    snprintf(b, sizeof b, " %.3f", v); s += b;
+                    if (s.size() > 900) { logf("%s", s.c_str()); s = head; }   // (logf's 1 KB line: continued on the next)
+                }
+                if (s.size() > head.size()) logf("%s", s.c_str());
+            }
+        }
+        for (size_t c = 0; c < nc; c++) {
+            const char* nm = cfgs[c].name.c_str();
+            const double cpu = median(ms[c]), all = median(ms_all[c]);
+            logf("vk: bench cfg %s: draws %lld, cpu median %.3f min %.3f, all median %.3f min %.3f, n %d", nm,
+                 (long long)(cfg_draws[c] / times), cpu, ms[c].front(), all, ms_all[c].front(), times);
+            int n = snprintf(line, sizeof line, "vk: bench cfg %s: phase medians (ms):", nm);
+            for (int k = 2; k < PROF_COUNT; k++)
+                n += snprintf(line + n, sizeof line - n, " %s %.3f%s", names[k], median(ph[c][k]), k + 1 < PROF_COUNT ? "," : "");
+            logf("%s", line);
+        }
+        if (fmode) at = -3;
         vkDeviceWaitIdle(dev.device);
-        ub_updates.resize(ub_before);   // (the last time's uniform updates are written: as if pruned)
-        const auto t0 = std::chrono::steady_clock::now();
-        for (const auto& h : frame_submits) bench_replay(h);
-        ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        prof_full--;
+        replayed_hold = 0;
+        return;
     }
+    {
+        std::vector<double> s = ms_all[0];
+        std::sort(s.begin(), s.end());
+        logf("vk: bench: with the GPU done: median %.2f ms, min %.2f, max %.2f", s[s.size() / 2], s.front(), s.back());
+    }
+    if (fmode) at = -3;
     vkDeviceWaitIdle(dev.device);
     prof_full--;
     int64_t draws1 = 0;
     draw_stats(&draws1, &sk, &di, &pl);
     replayed_hold = 0;
-    std::vector<double> sorted = ms;
+    std::vector<double> sorted = ms[0];
     std::sort(sorted.begin(), sorted.end());
     double sum = 0;
-    for (double v : ms) sum += v;
+    for (double v : ms[0]) sum += v;
     logf("vk: bench: the frame before present %lld (%zu submits, %lld draws) replayed %d times: median %.2f ms, min %.2f, "
          "mean %.2f, max %.2f", (long long)at, frame_submits.size(), (long long)((draws1 - draws0) / times), times,
          sorted[sorted.size() / 2], sorted.front(), sum / times, sorted.back());
-    static const char* names[PROF_COUNT] = {"submit", "present", "draw", "descriptors", "texture lookups", "uploads",
-                                            "pipelines", "programs", "commands", "dispatch", "memory sync",
-                                            "queue submit", "slot wait"};
-    char line[600];
     int n = snprintf(line, sizeof line, "vk: bench: a replay's time (ms):");
     for (int i = 2; i < PROF_COUNT; i++)
         n += snprintf(line + n, sizeof line - n, " %s %.2f%s", names[i], (prof_ns[i] - prof0[i]) / (double)times / 1e6,
                       i + 1 < PROF_COUNT ? "," : "");
     logf("%s", line);
+    n = snprintf(line, sizeof line, "vk: bench: a replay's time (ms), medians:");
+    for (int i = 2; i < PROF_COUNT; i++) {
+        std::sort(ph[0][i].begin(), ph[0][i].end());
+        n += snprintf(line + n, sizeof line - n, " %s %.2f%s", names[i], ph[0][i][ph[0][i].size() / 2], i + 1 < PROF_COUNT ? "," : "");
+    }
+    logf("%s", line);
+    logf("vk: bench: slot wait largest %.2f ms; a replay began %.1f recordings (ring %d), %.1f of them waited over 0.1 ms",
+         ph[0][PROF_SLOTWAIT].back(), (st_begun - begun0) / (double)times, kRecordings, (st_slot_waits - waits0) / (double)times);
 }
 
 /// A slow submit (over 15 ms): what took its time, logged (60 of them). The stalls in it are exact (PROF, PROF_EXACT); the
