@@ -357,6 +357,27 @@ bool skip_live(uint64_t key) {
     }
     return std::binary_search(keys.begin(), keys.end(), key);
 }
+/// (local) RX_VK_HALF_PROG=<program key prefixes, comma separated>: the draws and dispatches of those programs run on even
+/// frames only. On odd ones their draws are left out where the targets hold an earlier frame's picture, their dispatches
+/// always: what they wrote the frame before stays. For costly effects that change slowly (volumetric fog, light scattering);
+/// a program whose output the game keeps in memory it reuses each frame shows stale or garbage pixels on odd frames
+bool half_prog(uint64_t key) {
+    static const std::vector<std::pair<uint64_t, uint64_t>> keys = [] {   // (value, mask) of each prefix
+        std::vector<std::pair<uint64_t, uint64_t>> v;
+        for (const char* q = getenv("RX_VK_HALF_PROG") ? getenv("RX_VK_HALF_PROG") : ""; *q;) {
+            const char* e = q;
+            while (*e && *e != ',') e++;
+            const size_t n = std::min<size_t>((size_t)(e - q), 16);
+            if (n) v.push_back({strtoull(std::string(q, n).c_str(), nullptr, 16) << (4 * (16 - n)), n == 16 ? ~0ull : ~(~0ull >> (4 * n))});
+            q = *e ? e + 1 : e;
+        }
+        return v;
+    }();
+    if (keys.empty() || !(texture_frame_no() & 1)) return false;
+    for (const auto& [value, mask] : keys)
+        if ((key & mask) == value) return true;
+    return false;
+}
 void stats_note_bind(uint64_t prog, int stage, uint64_t addr, uint64_t size, bool written, bool table, uint32_t cbuf = 0,
                      uint32_t off = 0, uint64_t raw = 0, uint64_t vkbuf = 0, uint64_t vkoff = 0) {
     if (!stats_frame_now()) return;
@@ -1611,6 +1632,13 @@ uint32_t aniso_override() {
     static const uint32_t n = getenv("RX_VK_ANISO") ? (uint32_t)std::clamp(atoi(getenv("RX_VK_ANISO")), 0, 16) : 0u;
     return n;
 }
+/// (local) RX_VK_LOD_BIAS=<mip levels, e.g. 0.5>: added to the mip bias of the samplers that filter linearly between texels and
+/// mip levels (not the depth-compare ones): smaller mips read, less memory traffic on a shared-memory GPU, softer textures.
+/// Part of every sampler's key below, as RX_VK_ANISO. 0 (the default): the game's bias
+float lod_bias_extra() {
+    static const float b = getenv("RX_VK_LOD_BIAS") ? std::clamp((float)atof(getenv("RX_VK_LOD_BIAS")), -4.0f, 4.0f) : 0.0f;
+    return b;
+}
 /// compare: the shader reads depth with a reference (a sampler without one cannot compare)
 VkSampler sampler_make(int id, bool compare);
 // (each texture of each draw found its sampler through reg_mu, a copy of the registration, a hash of it and a map lookup:
@@ -1632,6 +1660,12 @@ VkSampler sampler_make(int id, bool compare) {
     nvn_samp_par p{};
     if (!sampler_of(id, &p)) p.minf = NVN_MIN_FILTER_LINEAR, p.magf = NVN_MAG_FILTER_LINEAR, p.lod_max = 1000.0f;
     uint64_t key = mix(compare ? 0xC0 : 0xAB, aniso_override());
+    {
+        const float lb = lod_bias_extra();
+        uint32_t lbits;
+        std::memcpy(&lbits, &lb, sizeof lbits);
+        if (lbits) key = mix(key, lbits);
+    }
     const uint8_t* b = reinterpret_cast<const uint8_t*>(&p);
     for (size_t i = 0; i < sizeof p; i += 8) {
         uint64_t w = 0;
@@ -1664,6 +1698,9 @@ VkSampler sampler_make(int id, bool compare) {
     }
     if (aniso_override() && ci.minFilter == VK_FILTER_LINEAR && ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR)
         aniso = std::max(aniso, (float)aniso_override());
+    if (lod_bias_extra() != 0.0f && !compare && ci.minFilter == VK_FILTER_LINEAR && ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR)
+        ci.mipLodBias = std::clamp(ci.mipLodBias + lod_bias_extra(), -dev.props.limits.maxSamplerLodBias,
+                                   dev.props.limits.maxSamplerLodBias);   // (local, RX_VK_LOD_BIAS)
     ci.anisotropyEnable = aniso > 1.0f && dev.features.samplerAnisotropy;
     ci.maxAnisotropy = std::clamp(aniso, 1.0f, dev.props.limits.maxSamplerAnisotropy);
     ci.compareEnable = compare && p.cmp_mode != 0;
@@ -3629,6 +3666,63 @@ uint16_t draw_hazards(VkCommandBuffer cmd, const Program& p, const NvnState& s, 
 
 } // namespace
 
+/// (local) RX_VK_SHADOW_HALF=1: the sun's shadow cascades (square depth targets past 768 drawn without colour, as
+/// RX_VK_CASCADE_BIAS) drawn every other frame: on the frames between, their clears (here, clear_depth_stencil, vk_xfer.cpp's
+/// clear_tex) and draws are all left out and each cascade keeps the depth of the frame before. Decided by the texture and the
+/// frame number only, so the order the parallel threads record in does not matter; a texture the game alternates between
+/// frames is drawn each time it is used. Off by default.
+/// (local) RX_VK_SHADOW_LAYERS=<mask>: the same per cascade layer (the 2D view's layer: OoT's cascades are the 3 layers of one
+/// 1000x1000x3 texture): the layers whose bit is set drawn every other frame, staggered (layer L left out on frames where
+/// frame + L is odd, and only after a frame it was drawn in), so =6 draws layer 0 every frame and 1 and 2 in turn. Ignored when
+/// RX_VK_SHADOW_HALF is on. Off by default
+bool shadow_half_skip(const Texture* depth, uint32_t width, uint32_t height, uint32_t layer) {
+    const bool on = hc_flag[HC_SHADOW_HALF] != 0;
+    const uint32_t layers = (uint32_t)hc_flag[HC_SHADOW_LAYERS];
+    if ((!on && !layers) || !depth || width != height || width <= 768) return false;
+    if (on) layer = 0;   // (the whole texture)
+    else if (layer >= 32 || !(layers >> layer & 1)) return false;
+    const uint64_t now = texture_frame_no();
+    static std::mutex mu;
+    static std::map<std::pair<const Texture*, uint32_t>, uint64_t> drawn;   // (the frame each cascade was last drawn in)
+    std::lock_guard lk(mu);
+    uint64_t& last = drawn[{depth, layer}];
+    if (last && now == last + 1 && depth->first_render_frame && depth->first_render_frame < now && (on || ((now + layer) & 1)))
+        return true;
+    last = now;
+    return false;
+}
+
+/// (local) RX_VK_SHADOW_MIN_INDICES=<n>[,<first layer>]: direct, non-mesh draws into the sun's cascades (as above) of fewer than
+/// n vertices or indices (times instances) left out, on layers from <first layer> (default 0) up: small props cast no sun
+/// shadow there. Counted in the "skips a frame by vk_draw.cpp line" report. RX_VK_LOG_CASCADES=1: every 600 frames, the
+/// cascade draws a frame by layer, and by size (< 64, < 256, < 1024, more vertices/indices; indirect and mesh draws apart). Off
+/// by default
+bool shadow_small_skip(const Targets& at, const DrawArgs& d) {
+    if (at.n != 0 || !at.depth || at.width != at.height || at.width <= 768) return false;
+    const int min_n = hc_flag[HC_SHADOW_MIN_INDICES], first_layer = hc_flag[HC_SHADOW_MIN_LAYER];
+    static const bool log_on = getenv("RX_VK_LOG_CASCADES") != nullptr;
+    const bool direct = !d.indirect && !d.mesh;
+    const int64_t n = (int64_t)d.count * std::max(1, d.instances);
+    if (log_on) {
+        static std::atomic<int64_t> by_layer[4], by_size[5];
+        static std::atomic<uint64_t> from{0};
+        by_layer[std::min<uint32_t>(at.depth_layer, 3)]++;
+        by_size[!direct ? 4 : n < 64 ? 0 : n < 256 ? 1 : n < 1024 ? 2 : 3]++;
+        const uint64_t now = texture_frame_no();
+        uint64_t f = from.load();
+        if (!f) from.compare_exchange_strong(f, now);
+        else if (now >= f + 600 && from.compare_exchange_strong(f, now)) {
+            double k = 1.0 / (now - f);
+            int64_t l[4], z[5];
+            for (int i = 0; i < 4; i++) l[i] = by_layer[i].exchange(0);
+            for (int i = 0; i < 5; i++) z[i] = by_size[i].exchange(0);
+            logf("vk: cascade draws a frame: layer 0 %.1f, 1 %.1f, 2 %.1f, 3+ %.1f; < 64 %.1f, < 256 %.1f, < 1024 %.1f, more %.1f, "
+                 "indirect/mesh %.1f", l[0] * k, l[1] * k, l[2] * k, l[3] * k, z[0] * k, z[1] * k, z[2] * k, z[3] * k, z[4] * k);
+        }
+    }
+    return min_n > 0 && direct && n < min_n && (int)at.depth_layer >= first_layer;
+}
+
 void clear_color_target(VkCommandBuffer cmd, NvnState& s, int index, const float rgba[4], uint32_t mask) {
     ParLock lk;
     mask &= 0xF;
@@ -3673,6 +3767,7 @@ void clear_depth_stencil(VkCommandBuffer cmd, NvnState& s, float depth, bool dep
     ParLock lk;
     const Targets at = targets(s);
     if (!at.depth) return;
+    if (at.n == 0 && shadow_half_skip(at.depth, at.width, at.height, at.depth_layer)) return;   // (local, RX_VK_SHADOW_HALF)
     VkImageAspectFlags aspect = 0;
     if (depth_mask && depth_aspect(at.depth_format)) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
     if (stencil_mask && has_stencil(at.depth_format)) aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -5223,6 +5318,13 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         SKIP_HERE();
     }
     const Targets at = bare_targets(s, targets(s));
+    {   // (local) RX_VK_MESH_NO_SHADOW=1: mesh draws (grass, foliage) into square depth-only targets (the shadow maps) left out:
+        // the mesh fallback costs most there, and grass then casts no shadow. The scene's own depth passes are not square
+        static const bool mesh_no_shadow = getenv("RX_VK_MESH_NO_SHADOW") != nullptr;
+        if (mesh_no_shadow && d.mesh && at.n == 0 && at.width == at.height) SKIP_HERE();
+    }
+    if (at.n == 0 && shadow_half_skip(at.depth, at.width, at.height, at.depth_layer)) return;   // (local, RX_VK_SHADOW_HALF)
+    if (shadow_small_skip(at, d)) SKIP_HERE();   // (local, RX_VK_SHADOW_MIN_INDICES)
     if (!at.width || !at.height) SKIP_HERE();
     // (hookshot) the scene's camera and depth for NVIDIA DLSS (vk_dlss.cpp): the vertex stage's uniform buffer 3 (NVN's binding 0)
     if (at.n && at.color[0] && at.depth)
@@ -5321,6 +5423,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             if (skip) return;
         }
     }
+    if (half_prog(cp->key) && targets_persistent(at)) return;   // (local, RX_VK_HALF_PROG: an odd frame)
     // Not ready (translating, or its pipeline building): left out of the frame when its targets hold an earlier
     // frame's picture already, which shows for a frame without it; waited for otherwise (a pass drawn once, a target
     // made this frame), as totk-pc-recomp's TOTK_PIPE_SKIP rule. RX_VK_PIPE_WAIT=1: always waited for.
@@ -6941,6 +7044,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             }
         }
     }
+    if (half_prog(cp->key)) return;   // (local, RX_VK_HALF_PROG: an odd frame)
     dclock.key = cp->key;
     texture_watch_prog(cp->key);
     {   // (hookshot, RX_VK_LOG_PUSH=<key prefix>: once, that program's push constants and the c0 words it reads)

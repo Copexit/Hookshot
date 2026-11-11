@@ -950,6 +950,116 @@ void mesh_nocull(Shader::IR::Program& program, uint64_t code_key) {
              made ? "off, every meshlet drawn" : "pattern not found, left as it is");
 }
 
+// (local) RX_VK_OOT_SHADOW_TAPS=<1|4|9|16>, off unless set. OoT's forward-lit material programs pick each light's shadow filter
+// from a 2-bit field of its record (bits 0-1 of word 0, fragment storage buffer at c0+0x520): 0 one depth compare, 1/2/3 a
+// 2x2/3x3/4x4 grid, through a BRX whose table is in c1 (LDC c1[umin(field - 1, 3) * 4], c1[16 + ...] for the second compare
+// group). That field (BitFieldUExtract #0, #2 at the root of a dynamic c1 read, in a fragment program with depth compares)
+// becomes umin(field, cap): fewer taps, harder shadow edges. Under RX_VK_OOT, so the program cache starts again when it changes
+size_t oot_shadow_taps(Shader::IR::Program& program, uint64_t key) {
+    using namespace Shader::IR;
+    static const int taps = getenv("RX_VK_OOT_SHADOW_TAPS") ? atoi(getenv("RX_VK_OOT_SHADOW_TAPS")) : 0;
+    if (taps <= 0 || taps >= 16 || program.stage != Shader::Stage::Fragment) return 0;
+    const uint32_t cap = taps >= 9 ? 2 : taps >= 4 ? 1 : 0;
+    bool dref = false;
+    std::unordered_set<Inst*> fields;
+    for (Block* block : program.blocks)
+        for (Inst& inst : block->Instructions()) {
+            switch (inst.GetOpcode()) {
+            case Opcode::ImageSampleDrefImplicitLod: case Opcode::ImageSampleDrefExplicitLod: case Opcode::ImageGatherDref:
+            case Opcode::BoundImageSampleDrefImplicitLod: case Opcode::BoundImageSampleDrefExplicitLod: case Opcode::BoundImageGatherDref:
+            case Opcode::BindlessImageSampleDrefImplicitLod: case Opcode::BindlessImageSampleDrefExplicitLod:
+            case Opcode::BindlessImageGatherDref: dref = true; continue;
+            case Opcode::GetCbufU32: break;
+            default: continue;
+            }
+            const Value bank = inst.Arg(0).Resolve();
+            if (!bank.IsImmediate() || bank.U32() != 1 || inst.Arg(1).Resolve().IsImmediate()) continue;
+            // (back from the table's offset through the index arithmetic and phis, to the field)
+            std::vector<Inst*> todo{inst.Arg(1).InstRecursive()};
+            std::unordered_set<Inst*> seen;
+            while (!todo.empty() && seen.size() < 64) {
+                Inst* i = todo.back();
+                todo.pop_back();
+                if (!seen.insert(i).second) continue;
+                const Opcode op = i->GetOpcode();
+                if (op == Opcode::BitFieldUExtract) {
+                    const Value off = i->Arg(1).Resolve(), count = i->Arg(2).Resolve();
+                    if (off.IsImmediate() && off.U32() == 0 && count.IsImmediate() && count.U32() == 2) fields.insert(i);
+                    continue;
+                }
+                if (op != Opcode::IAdd32 && op != Opcode::UMin32 && op != Opcode::ShiftLeftLogical32 && op != Opcode::Phi) continue;
+                for (size_t a = 0; a < i->NumArgs(); a++)
+                    if (const Value v = i->Arg(a).Resolve(); !v.IsImmediate()) todo.push_back(v.InstRecursive());
+            }
+        }
+    if (!dref || fields.empty()) return 0;
+    size_t made = 0;
+    for (Block* block : program.blocks)
+        for (auto it = block->Instructions().begin(); it != block->Instructions().end(); ++it) {
+            if (!fields.count(&*it)) continue;
+            const auto original = block->PrependNewInst(it, *it);
+            IREmitter ir{*block, it};
+            it->ReplaceUsesWith(ir.UMin(U32{Value{&*original}}, ir.Imm32(cap)));
+            made++;
+        }
+    static std::atomic<int> told{0};
+    if (made && told++ < 16)
+        logf("vk: program %016llx: shadow filter field capped at %u (RX_VK_OOT_SHADOW_TAPS=%d), %zu edits", (unsigned long long)key,
+             cap, taps, made);
+    return made;
+}
+
+// (local) RX_VK_OOT_LIGHT_CAP=<n>, n >= 1, off unless set. OoT's forward-lit fragment programs (the lake water and
+// the lit materials) walk the clustered light list: `for (i = 0; ; ) { ...; if (++i >= n) break; }`
+// with n read from the cluster's storage buffer (the water's second loop: min(n, c6[452]) + 1). Each such exit compare,
+// SGreaterThanEqual(IAdd32(phi, 1), n) with the phi fed back by that IAdd and n rooted in a storage/global load, gets
+// smin(n, cap): at most cap lights a pixel, the rest left out. Loops whose count is a constant or a uniform (blur kernels) are
+// not touched. Under RX_VK_OOT, so the program cache starts again when it changes
+size_t oot_light_cap(Shader::IR::Program& program, uint64_t key) {
+    using namespace Shader::IR;
+    static const int cap = getenv("RX_VK_OOT_LIGHT_CAP") ? atoi(getenv("RX_VK_OOT_LIGHT_CAP")) : 0;
+    if (cap <= 0 || program.stage != Shader::Stage::Fragment) return 0;
+    const auto from_load = [](Value v) {   // (back through the count's arithmetic and phis, to a buffer load)
+        if (v.IsImmediate()) return false;
+        std::vector<Inst*> todo{v.InstRecursive()};
+        std::unordered_set<Inst*> seen;
+        while (!todo.empty() && seen.size() < 32) {
+            Inst* i = todo.back();
+            todo.pop_back();
+            if (!seen.insert(i).second) continue;
+            const Opcode op = i->GetOpcode();
+            if (op == Opcode::LoadStorage32 || op == Opcode::LoadGlobal32) return true;
+            if (op != Opcode::IAdd32 && op != Opcode::SMin32 && op != Opcode::UMin32 && op != Opcode::Phi) continue;
+            for (size_t a = 0; a < i->NumArgs(); a++)
+                if (const Value w = i->Arg(a).Resolve(); !w.IsImmediate()) todo.push_back(w.InstRecursive());
+        }
+        return false;
+    };
+    size_t made = 0;
+    for (Block* block : program.blocks)
+        for (auto it = block->Instructions().begin(); it != block->Instructions().end(); ++it) {
+            if (it->GetOpcode() != Opcode::SGreaterThanEqual) continue;
+            const Value next = it->Arg(0).Resolve(), n = it->Arg(1).Resolve();
+            if (next.IsImmediate() || next.InstRecursive()->GetOpcode() != Opcode::IAdd32) continue;
+            Inst* add = next.InstRecursive();
+            const Value a0 = add->Arg(0).Resolve(), a1 = add->Arg(1).Resolve();
+            const Value counter = a1.IsImmediate() && a1.U32() == 1 ? a0 : a0.IsImmediate() && a0.U32() == 1 ? a1 : Value{};
+            if (counter.IsEmpty() || counter.IsImmediate() || counter.InstRecursive()->GetOpcode() != Opcode::Phi) continue;
+            Inst* phi = counter.InstRecursive();
+            bool fed_back = false;
+            for (size_t a = 0; a < phi->NumArgs() && !fed_back; a++)
+                fed_back = !phi->Arg(a).Resolve().IsImmediate() && phi->Arg(a).Resolve().InstRecursive() == add;
+            if (!fed_back || !from_load(n)) continue;
+            IREmitter ir{*block, it};
+            it->SetArg(1, ir.SMin(U32{n}, ir.Imm32((uint32_t)cap)));
+            made++;
+        }
+    static std::atomic<int> told{0};
+    if (made && told++ < 32)
+        logf("vk: program %016llx: light loop capped at %d (RX_VK_OOT_LIGHT_CAP), %zu loops", (unsigned long long)key, cap, made);
+    return made;
+}
+
 // ---- (hookshot) The program cache, hookshot_programs.bin beside the executable: what translation made, by the key of the
 // stages' code and inputs. A program met for the first time stopped the frame for its translation, 9 s of it each run,
 // the long stutters when walking somewhere (replay workers in jobs_wait for up to 150 ms). The pipelines themselves were
@@ -1502,6 +1612,25 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             p.stages.push_back(std::move(st));
         } else {
             Env vs_env{s, *vsc, Shader::Stage::VertexB};
+            // (local) RX_VK_OOT_FOLLOW_SKIP=<key prefix>[,...]: these programs' stages without the page-table fallback for
+            // pointers (spirv_emit_context.cpp DefineGlobalMemoryFunctions): ~40% of a lake material's vertex code. In the
+            // fingerprint (RX_VK_OOT prefix)
+            {
+                static const std::string skip = getenv("RX_VK_OOT_FOLLOW_SKIP") ? getenv("RX_VK_OOT_FOLLOW_SKIP") : "";
+                char hex[24];
+                snprintf(hex, sizeof hex, "%016llx", (unsigned long long)p.key);
+                bool hit = false;
+                for (size_t at = 0; !hit && at < skip.size();) {
+                    const size_t e = skip.find(',', at);
+                    const std::string k = skip.substr(at, e == std::string::npos ? std::string::npos : e - at);
+                    hit = !k.empty() && !strncmp(hex, k.c_str(), k.size());
+                    at = e == std::string::npos ? skip.size() : e + 1;
+                }
+                Shader::Backend::SPIRV::follow_skip_this = hit;
+            }
+            struct ResetSkip {
+                ~ResetSkip() { Shader::Backend::SPIRV::follow_skip_this = false; }
+            } reset_skip;
             auto vs = translate(vs_env, true);
             questions += vs_env.texture_questions;
             Shader::RuntimeInfo vrt{};
@@ -1535,6 +1664,8 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                 auto fs = translate(fs_env, true);
                 questions += fs_env.texture_questions;
                 oot_visual(fs->program, fsc->key);
+                oot_shadow_taps(fs->program, fsc->key);   // (local, RX_VK_OOT_SHADOW_TAPS)
+                oot_light_cap(fs->program, fsc->key);     // (local, RX_VK_OOT_LIGHT_CAP)
                 Shader::RuntimeInfo frt{};
                 frt.previous_stage_stores = vs->program.info.stores;
                 for (int i = 0; i < 8; i++) frt.color_output_types[i] = static_cast<Shader::AttributeType>(color_types[i]);
@@ -1734,6 +1865,8 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
         if (fsc) {
             Env fenv{s, *fsc, Shader::Stage::Fragment};
             auto fs = translate(fenv, true);
+            oot_shadow_taps(fs->program, fsc->key);   // (local, RX_VK_OOT_SHADOW_TAPS)
+            oot_light_cap(fs->program, fsc->key);     // (local, RX_VK_OOT_LIGHT_CAP)
             questions += fenv.texture_questions;
             Shader::RuntimeInfo frt{};
             // (what the mesh program stores, and its per-primitive generics: Eden's MakeRuntimeInfo)

@@ -25,5 +25,9 @@ inline bool frag_nan_guard = false;
 // the colour pass is then rejected in spots: holes showing the bright sky, blown up by bloom (the glowing flowers).
 // On for every card but NVIDIA (vk_coopmat.cpp); RX_VK_NO_INVARIANT=1 off. From NX2navi patch 0007.
 inline bool position_invariant = false;
+// (local, RX_VK_OOT_FOLLOW_SKIP=<key prefixes>) the graphics program being emitted is one of those: its vertex and fragment
+// stages get no page-table fallback for pointers no bound buffer holds, as with RX_VK_FOLLOW_GRAPHICS=0 for that program
+// alone. Set by vk_shader.cpp translate_into on the translating thread
+inline thread_local bool follow_skip_this = false;
 
 } // namespace Shader::Backend::SPIRV

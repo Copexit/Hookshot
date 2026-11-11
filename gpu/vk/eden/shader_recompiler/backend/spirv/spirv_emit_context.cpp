@@ -1087,7 +1087,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     static const bool graphics{!getenv("RX_VK_FOLLOW_GRAPHICS") || atoi(getenv("RX_VK_FOLLOW_GRAPHICS")) != 0};
     const bool graphics_stage{stage == Stage::VertexB || stage == Stage::Fragment};
     const bool follow_pointers{(stage == Stage::Compute || (!no_mesh && (stage == Stage::Task || stage == Stage::Mesh)) ||
-                                (graphics && graphics_stage && !info.uses_render_area)) && !no_follow};
+                                (graphics && graphics_stage && !info.uses_render_area && !follow_skip_this)) && !no_follow};
     Id ptr_u64{};
     if (follow_pointers) {
         wants_guest_pages = true;
