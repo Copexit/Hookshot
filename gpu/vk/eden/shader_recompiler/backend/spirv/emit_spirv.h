@@ -46,7 +46,7 @@ constexpr u32 MESH_FALLBACK_RECORDS_PUSH_OFFSET = MESH_FALLBACK_PUSH_OFFSET + 8;
 constexpr u32 MESH_FALLBACK_PUSH_END = MESH_FALLBACK_PUSH_OFFSET + 16;
 // (hookshot) the fallback's mesh workgroups a draw can run: each gets a record slot and a payload. The vertex stage draws
 // this many slots and holds the ones no mesh workgroup wrote to outside the clip volume.
-constexpr u32 MESH_FALLBACK_CAPACITY = 1024;
+constexpr u32 MESH_FALLBACK_CAPACITY = 2048;
 
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
 [[nodiscard]] inline std::vector<u32> EmitSPIRV(const Profile& profile, IR::Program& program) {
