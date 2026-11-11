@@ -10,14 +10,14 @@ enum { GAME = 0, DLSS = 1, DLAA = 2 };
 /// opts.resolution: 0 Auto (the game's dynamic resolution), else a share of the output in percent. 1 to 4 are the values from
 /// before (100, 75, 67, 50: saved options keep their meaning); 5 and 6 came with DLSS's Balanced and Ultra Performance. Each
 /// is a twelfth of the output (vk_menu.cpp twelfths): 8/12, 7/12, 6/12 and 4/12 are DLSS's own ratios
-constexpr int kPercent[] = {0, 100, 75, 67, 50, 58, 33};
+constexpr int kPercent[] = {0, 100, 75, 67, 50, 58, 33, 42};   // (local: 7, 42% = 5/12, for small GPUs)
 constexpr int kValues = sizeof kPercent / sizeof kPercent[0];
 inline int percent(int v) { return v > 0 && v < kValues ? kPercent[v] : 0; }
 
 /// The steps the Render resolution row takes, best first after Auto. DLSS: its Quality, Balanced, Performance and Ultra
 /// Performance; Auto too, since DLSS follows the game's dynamic size (vk_dlss.cpp makes its feature again when the size
 /// leaves the mode's range). DLAA: none (the 3D is drawn at full size)
-constexpr int kGameSteps[] = {0, 1, 2, 3, 4};
+constexpr int kGameSteps[] = {0, 1, 2, 3, 4, 5, 7, 6};   // (local: 58, 42 and 33 too)
 constexpr int kDlssSteps[] = {0, 3, 5, 4, 6};
 inline const int* steps(int upscaler, int& n) {
     if (upscaler == DLSS) return n = sizeof kDlssSteps / sizeof kDlssSteps[0], kDlssSteps;
