@@ -5050,7 +5050,8 @@ bool shared_fallback(SharedFallback& b, uint64_t want) {
     void* mapped = nullptr;
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;   // (local: RX_VK_MESH_COMPACT draws from the records)
+                                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |   // (local: RX_VK_MESH_COMPACT draws from the records)
+                                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT;   // (local, meshfast: RX_VK_MESH_INDEXED's indices too)
     SharedFallback n;
     if (!create_buffer(size, usage, false, n.buffer, n.mem, &mapped)) return false;
     n.size = size;
@@ -5166,6 +5167,8 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
         vkCmdFillBuffer(cmd, f->records, 0, 4, 0);
         vkCmdFillBuffer(cmd, f->records, 4, 4, 1);
         vkCmdFillBuffer(cmd, f->records, 8, 8, 0);
+        // (local, meshfast: RX_VK_MESH_INDEXED draws indexed from words 0-4 {indices, 1, 0, 0, 0}; the indices from word capacity)
+        if (p.fallback_indexed) vkCmdFillBuffer(cmd, f->records, 16, 4, 0);
     } else {
         vkCmdFillBuffer(cmd, f->records, 0, (VkDeviceSize)capacity * 4, 0);   // (the slots this draw runs)
     }
@@ -5754,7 +5757,11 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     if (d.mesh) {
         if (p.fallback) {   // (hookshot: the generated vertex stage reads the records; one vertex a corner)
-            if (fallback_vertex_count && fallback_indirect)   // (local: RX_VK_MESH_COMPACT, only the vertices written)
+            if (fallback_vertex_count && fallback_indirect && p.fallback_indexed) {   // (local, meshfast: RX_VK_MESH_INDEXED)
+                bind_index(cmd, fallback_indirect, (VkDeviceSize)Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY * 4,
+                           VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexedIndirect(cmd, fallback_indirect, 0, 1, 20);
+            } else if (fallback_vertex_count && fallback_indirect)   // (local: RX_VK_MESH_COMPACT, only the vertices written)
                 vkCmdDrawIndirect(cmd, fallback_indirect, 0, 1, 16);
             else if (fallback_vertex_count) vkCmdDraw(cmd, fallback_vertex_count, 1, 0, 0);
             st_mesh++;

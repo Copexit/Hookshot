@@ -54,4 +54,9 @@ constexpr u32 MESH_FALLBACK_CAPACITY = 2048;
     return EmitSPIRV(profile, {}, program, binding);
 }
 
+/// (local, meshfast) RX_VK_MESH_INDEXED=1: whether this mesh program's fallback writes indexed output (each started mesh workgroup's
+/// vertices once plus 3 indices a primitive, drawn with vkCmdDrawIndexedIndirect) instead of a full record a primitive corner.
+/// The shader side and the host (vk_shader.cpp Program::fallback_indexed) both ask this
+[[nodiscard]] bool FallbackIndexed(const MeshInfo& mesh);
+
 } // namespace Shader::Backend::SPIRV

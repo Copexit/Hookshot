@@ -295,6 +295,45 @@ void MeshFallbackEpilogue(EmitContext& ctx) {
                 StoreWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index, slot), count);
             });
         }
+        if (FallbackIndexed(mesh)) {
+            // (local, meshfast) the workgroup's vertices once, column by column (line l of vertex v at vertices_at + l * column
+            // + slot * max_vertices + v: consecutive threads write consecutive words), then 3 indices a primitive from `base`
+            // (the compact atomic add above). Slot-based vertex placement needs no second atomic; unwritten slots are never
+            // indexed. 3 to 6 times fewer record words than a record a corner, and the indexed draw shades shared vertices once
+            const u32 vertex_lines{static_cast<u32>(mesh.vertex_lines.size())};
+            const u32 column{MESH_FALLBACK_CAPACITY * mesh.max_vertices};
+            const u32 vertices_at{MESH_FALLBACK_CAPACITY + MESH_FALLBACK_CAPACITY * per_slot};
+            const Id first_vertex{ctx.OpIMul(ctx.U32[1], slot, ctx.Const(mesh.max_vertices))};
+            const Id invocation{LocalInvocation(ctx)};
+            If(ctx, ctx.OpINotEqual(ctx.U1, count, ctx.u32_zero_value), [&] {
+                Strided(ctx, mesh.max_vertices, ctx.mesh_threads, invocation, [&](Id vertex) {
+                    const Id at{ctx.OpIAdd(ctx.U32[1], first_vertex, vertex)};
+                    for (u32 line = 0; line < vertex_lines; ++line) {
+                        StoreWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index,
+                                                  ctx.OpIAdd(ctx.U32[1], at, ctx.Const(vertices_at + line * column))),
+                                  LineWord(ctx, ctx.mesh_attributes, vertex, 0, vertex_lines, line));
+                    }
+                });
+            });
+            Strided(ctx, mesh.max_primitives, ctx.mesh_threads, invocation, [&](Id primitive) {
+                If(ctx, ctx.OpULessThan(ctx.U1, primitive, count), [&] {
+                    for (u32 corner = 0; corner < 3; ++corner) {
+                        const Id byte{ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(3U)),
+                                                 ctx.Const(4U + corner))};
+                        const Id vertex{Clamped(ctx, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, byte)),
+                                                mesh.max_vertices)};
+                        const Id word{ctx.OpIAdd(
+                            ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
+                            ctx.OpIAdd(ctx.U32[1], base,
+                                       ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(3U)),
+                                                  ctx.Const(corner))))};
+                        StoreWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index, word),
+                                  ctx.OpIAdd(ctx.U32[1], first_vertex, vertex));
+                    }
+                });
+            });
+            return;
+        }
         const Id invocation{LocalInvocation(ctx)};
         Strided(ctx, mesh.max_primitives, ctx.mesh_threads, invocation, [&](Id primitive) {
             If(ctx, ctx.OpULessThan(ctx.U1, primitive, count), [&] {
@@ -543,6 +582,13 @@ void MeshEpilogue(EmitContext& ctx) {
 }
 } // Anonymous namespace
 
+bool FallbackIndexed(const MeshInfo& mesh) {
+    static const bool on{std::getenv("RX_VK_MESH_INDEXED") != nullptr};
+    // (triangles with no per-primitive lines only; the vertex region must fit where the corner records were)
+    return on && FallbackCompact() && mesh.Corners() == 3 && mesh.primitive_lines.empty() &&
+           !mesh.vertex_lines.empty() && mesh.max_vertices != 0 && mesh.max_vertices <= mesh.max_primitives * 3;
+}
+
 void EmitMeshFallbackVertexBody(EmitContext& ctx) {
     // (the fragment stage's inputs for the mesh program's per-primitive generics are Flat: the generated vertex
     // stage's outputs must match, and DefineOutputs only knows the stores, not which of them are per-primitive)
@@ -578,12 +624,12 @@ void EmitMeshFallbackVertexBody(EmitContext& ctx) {
         StorePosition(ctx, 3, ctx.Const(-1.0f));
     };
     // The record's words: its vertex lines (the position held back for the depth conversion), then its primitive lines.
-    const auto emit_record = [&](Id first) {
+    const auto emit_record = [&](Id first, u32 stride = 1) {   // (stride: meshfast's column layout)
         const auto read = [&](u32 word) {
             return ctx.OpBitcast(
                 ctx.F32[1],
                 LoadWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index,
-                                         ctx.OpIAdd(ctx.U32[1], first, ctx.Const(word)))));
+                                         ctx.OpIAdd(ctx.U32[1], first, ctx.Const(word * stride)))));
         };
         std::array<Id, 4> position{};
         for (u32 line = 0; line < vertex_lines; ++line) {
@@ -616,6 +662,14 @@ void EmitMeshFallbackVertexBody(EmitContext& ctx) {
     if (FallbackCompact()) {
         // (local) RX_VK_MESH_COMPACT=1: the records are packed from 0 and the draw covers only those written (an indirect
         // draw whose vertex count the mesh workgroups added up): every vertex is a live one, no count or validity to test
+        if (FallbackIndexed(mesh)) {
+            // (local, meshfast) the vertex index is the vertex's own: line l at vertices_at + l * column + vertex, which
+            // read(1 + l) gives from first = vertices_at - column + vertex (vertices_at > column: max_vertices <= per_slot)
+            const u32 column{MESH_FALLBACK_CAPACITY * mesh.max_vertices};
+            const u32 vertices_at{MESH_FALLBACK_CAPACITY + MESH_FALLBACK_CAPACITY * per_slot};
+            emit_record(ctx.OpIAdd(ctx.U32[1], vertex, ctx.Const(vertices_at - column)), column);
+            return;
+        }
         emit_record(ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
                                ctx.OpIMul(ctx.U32[1], vertex, ctx.Const(words))));
         return;

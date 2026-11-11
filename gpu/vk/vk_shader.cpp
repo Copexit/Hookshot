@@ -1333,7 +1333,8 @@ struct Reader {
 /// program_cache_each read the same fields. program_cache_each read only the first ones and took the mesh fallback's five words
 /// for the stage count: no kept program reached the prediction (vk_predict.cpp, "predicted 0 pipelines")
 void put_head(std::vector<uint8_t>& o, const Program& p) {
-    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | (p.fallback ? 4 : 0) | (p.fallback_task ? 8 : 0)));
+    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | (p.fallback ? 4 : 0) | (p.fallback_task ? 8 : 0) |
+                    (p.fallback_indexed ? 16 : 0)));
     put_list(o, p.answers);
     put_list(o, p.questions);
     put(o, p.workgroup);
@@ -1347,6 +1348,7 @@ void put_head(std::vector<uint8_t>& o, const Program& p) {
 void get_head(Reader& r, Program& p) {
     const uint32_t kind = r.get<uint32_t>();
     p.compute = (kind & 1) != 0, p.mesh = (kind & 2) != 0, p.fallback = (kind & 4) != 0, p.fallback_task = (kind & 8) != 0;
+    p.fallback_indexed = (kind & 16) != 0;   // (local, meshfast)
     r.list(p.answers);
     r.list(p.questions);
     p.workgroup = r.get<std::array<uint32_t, 3>>();
@@ -1861,6 +1863,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
             p.fallback_record_words = 1 + static_cast<u32>(mi.vertex_lines.size()) +
                                       static_cast<u32>(mi.primitive_lines.size());
             p.fallback_payload_words = mi.payload_words;
+            p.fallback_indexed = Shader::Backend::SPIRV::FallbackIndexed(mi);   // (local, meshfast)
         }
         if (fsc) {
             Env fenv{s, *fsc, Shader::Stage::Fragment};
