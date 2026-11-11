@@ -65,6 +65,7 @@ struct Texture {
     uint32_t release_gen = 0;
     uint64_t gpu_wrote_seen = 0;   // (the newest finished GPU write into its storage it was uploaded after)
     uint64_t last_written = 0;     // (the frame the GPU last wrote it: a render target, each frame it is used)
+    uint64_t last_written_value = 0;   // (local: the submission that did: rec_value)
     uint64_t first_written = 0;    // (the frame its GPU contents began: written in that frame alone, a table the game baked)
     uint64_t verify_hash = 0;      // (RX_VK_VERIFY_DIM: its guest memory's hash when last uploaded)
     uint32_t checked_epoch = 0;
@@ -125,6 +126,22 @@ void texture_segment_worker(int index);
 /// to it (submit it before the segment's uploads), 0: nothing, -1: something did and it could not be ended (lost: the
 /// replay stops)
 int texture_segment_end(int index);
+/// (local, RX_VK_DRY_OVERLAP) The dry pass runs while the segments' workers record: this thread (the replay thread) is in
+/// segment `index` of the stream (-1: off, the default), the segments numbered from `base` as texture_set_segment has them
+void texture_dry_segment(int index, uint64_t base);
+/// While one lives (ParLock taken before it), this thread records as the worker of the earliest segment still being recorded
+/// up to that index would into its init command buffer: its uploads and new images go there, and texture_segment() is that
+/// segment's. The replay thread's own uploads (the recording before the segments) are submitted ahead of every segment, so an
+/// image a worker made there (its first layout change in a segment's init) would be used before it is made. A no-op when
+/// texture_dry_segment is off
+bool texture_dry_enter();
+void texture_dry_leave();
+struct TextureDryScope {
+    bool on = texture_dry_enter();
+    ~TextureDryScope() {
+        if (on) texture_dry_leave();
+    }
+};
 /// Changes with every submission (a texture touched in it is not checked again in it)
 uint32_t texture_epoch();
 /// Changes whenever a texture is destroyed (pointers to textures kept elsewhere go stale)

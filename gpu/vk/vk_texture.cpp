@@ -2831,6 +2831,7 @@ void texture_written(Texture* tex) {
     watch_tex(tex, "written");
     if (!tex->gpu_written || tex->released) tex->first_written = frame_no;
     tex->last_written = frame_no;
+    tex->last_written_value = rec_value;
     tex->gpu_written = true;
     tex->gpu_gen = memory_generation();
     tex->released = false;
@@ -2930,6 +2931,41 @@ int texture_segment_end(int index) {
     if (s.used) full_barrier(s.cmd);   // (before its uploads and its commands)
     if (vkEndCommandBuffer(s.cmd) != VK_SUCCESS) return s.used ? -1 : 0;
     return s.used ? 1 : 0;
+}
+namespace {
+thread_local int tl_dry_index = -1;   // (RX_VK_DRY_OVERLAP: the segment the replay thread's dry pass is in)
+thread_local uint64_t tl_dry_base = 0, tl_dry_saved_seg = 0;
+thread_local SegInit* tl_dry_to = nullptr;
+thread_local VkCommandBuffer tl_dry_saved_cmd = VK_NULL_HANDLE;
+thread_local bool tl_dry_saved_used = false;
+}  // namespace
+void texture_dry_segment(int index, uint64_t base) {
+    tl_dry_index = index, tl_dry_base = base;
+}
+bool texture_dry_enter() {
+    if (tl_dry_index < 0) return false;
+    seg_init_mu.lock();   // (after ParLock, as a worker's InitRedirect inside texture_get takes it)
+    // (the earliest open one up to the dry pass's segment, as InitRedirect picks: the ones before it are recorded, and never
+    // use what is made or uploaded from now on; it and those after it are submitted after its init command buffer. The dry
+    // pass's own segment's worker starts only once the dry pass is past it, so that one at least is open)
+    for (int i = 0; i <= tl_dry_index && i < (int)seg_inits.size(); i++)
+        if (seg_inits[i].open) {
+            tl_dry_to = &seg_inits[i];
+            tl_dry_saved_cmd = up_cmd, tl_dry_saved_used = up_used, tl_dry_saved_seg = tl_seg;
+            up_cmd = tl_dry_to->cmd, up_used = tl_dry_to->used;
+            tl_seg = tl_dry_base + (uint64_t)i;
+            return true;
+        }
+    seg_init_mu.unlock();
+    static int logged;
+    if (logged++ < 20) logf("vk: dry overlap: BUG: no segment open up to %d: the dry pass's uploads go ahead of the segments", tl_dry_index);
+    return false;
+}
+void texture_dry_leave() {
+    tl_dry_to->used = up_used;
+    up_cmd = tl_dry_saved_cmd, up_used = tl_dry_saved_used, tl_seg = tl_dry_saved_seg;
+    tl_dry_to = nullptr;
+    seg_init_mu.unlock();
 }
 bool texture_marked(const Texture* tex) {
     return !tex || (tex->gpu_written && !tex->released && tex->uploaded && tex->owned_frame == frame_no &&

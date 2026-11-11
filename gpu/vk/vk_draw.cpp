@@ -7325,15 +7325,80 @@ void dry_mark_written(NvnState& s, bool compute, bool first) {
         static thread_local decltype(s.rt) last;
         if (!first && !std::memcmp(&last, &s.rt, sizeof last)) return;
         std::memcpy((void*)&last, (const void*)&s.rt, sizeof last);
+        // (RX_VK_DRY_OVERLAP: the workers record meanwhile. ParLock first, then the init redirect, the order a worker's
+        // texture_get takes them in; both no-ops otherwise)
+        ParLock lk;
+        TextureDryScope ds;
         const Targets at = targets(s);
         for (int i = 0; i < at.n; i++)
             if (at.color[i]) texture_written(at.color[i]);
         if (at.depth) texture_written(at.depth);
         return;
     }
+    // (local) RX_VK_DRY_MEMO=1: a dispatch's program, and when nothing else moved its marks, from a memo. Its key: the same
+    // program (nvn_prog bytes), the same handle words at every texture descriptor (k 0, what the picks' answers read) and every
+    // image descriptor (all k) of its program, read anew each time (handle programs included), and the same
+    // registrations_generation (the same slot versions and texture answers): program_for would give a variant valid for those
+    // textures, the same canonical answers, the same image descriptors and formats, so the memo's program stands in for it and
+    // the loop below makes the same texture_view_of calls. With texture_destroy_generation, texture_epoch and this thread's
+    // handle_hits (not emptied) unchanged too, those calls would hit their handle_hits entries and touch nothing: the marks
+    // are the memo's, made again in the same order. 2: both ways, mismatches logged
+    const int memo_mode = hc_flag[HC_DRY_MEMO];
+    struct Memo {
+        nvn_prog prog;
+        const Program* p;   // (program_for's answer, whose descriptors gave the words)
+        uint64_t reg, dgen, hits;
+        uint32_t epoch;
+        std::vector<uint32_t> words;
+        std::vector<Texture*> marks;
+    };
+    static thread_local std::unordered_map<uint64_t, const Program*> memo_prog;   // (by serial: the last answer)
+    static thread_local std::unordered_map<uint64_t, Memo> memo;                  // (by serial and words)
+    static thread_local std::vector<uint32_t> words;
+    static thread_local std::vector<Texture*> got;
+    static thread_local int64_t st_calls, st_prog, st_full, st_bad;
+    auto words_of = [&](const Program& q) {
+        words.clear();
+        uint64_t h = 1469598103934665603ull ^ s.prog.serial;
+        for (const Stage& st : q.stages) {
+            for (const auto& d : st.info.texture_descriptors) words.push_back(handle_of(s, st, d, 0));
+            for (const auto& d : st.info.image_descriptors)
+                for (uint32_t k = 0; k < d.count; k++) words.push_back(handle_of(s, st, d, k));
+        }
+        for (const uint32_t w : words) h = (h ^ w) * 1099511628211ull;
+        return h;
+    };
+    const uint64_t reg = registrations_generation(), dgen = texture_destroy_generation(), hits = handle_hits_clears;
+    const uint32_t ep = texture_epoch();
+    const Memo* hit = nullptr;
+    bool full = false;
+    if (memo_mode) {
+        if (++st_calls % 20000 == 0)
+            logf("vk: dry pass marks: of %lld dispatches, %lld took the memo's program, %lld its marks%s; %lld mismatched",
+                 (long long)st_calls, (long long)st_prog, (long long)st_full, memo_mode == 2 ? " (checked)" : "", (long long)st_bad);
+        if (const auto pi = memo_prog.find(s.prog.serial); pi != memo_prog.end()) {
+            const auto it = memo.find(words_of(*pi->second));
+            if (it != memo.end()) {
+                const Memo& m = it->second;
+                if (m.p == pi->second && m.reg == reg && m.words == words && !std::memcmp(&m.prog, &s.prog, sizeof m.prog)) {
+                    hit = &m;
+                    full = m.dgen == dgen && m.hits == hits && m.epoch == ep;
+                }
+            }
+        }
+        st_prog += hit != nullptr, st_full += full;
+        if (full && memo_mode == 1) {
+            ParLock lk;   // (RX_VK_DRY_OVERLAP, as above)
+            for (Texture* t : hit->marks) texture_written(t);
+            return;
+        }
+        got.clear();
+    }
     const uint8_t types[8]{};
-    const Program* p = program_for(s, ProgramKind::Compute, types);
+    const Program* p = hit && memo_mode == 1 ? hit->p : program_for(s, ProgramKind::Compute, types);
     if (!p || !p->ready.load(std::memory_order_acquire) || p->failed) return;
+    ParLock lk;   // (RX_VK_DRY_OVERLAP, as above: program_for outside it, a compile does not hold the workers)
+    TextureDryScope ds;
     for (const Stage& st : p->stages)
         for (const auto& d : st.info.image_descriptors) {
             if (!d.is_written) continue;
@@ -7342,10 +7407,25 @@ void dry_mark_written(NvnState& s, bool compute, bool first) {
                 const uint32_t handle = handle_of(s, st, d, k);
                 Texture* tex = nullptr;
                 uint32_t level = 0;
-                if (handle && texture_view_of(handle, vt, ViewUse::Storage, image_format(d.format), &tex, &level) && tex)
+                if (handle && texture_view_of(handle, vt, ViewUse::Storage, image_format(d.format), &tex, &level) && tex) {
                     texture_written(tex);
+                    if (memo_mode) got.push_back(tex);
+                }
             }
         }
+    if (!memo_mode) return;
+    if (hit && ((full && hit->marks != got) || (hit->p != p && hit->p->key != p->key)) && st_bad++ < 40)
+        logf("vk: dry pass marks: the memo gave program %016llx and %zu image(s), the dispatch %016llx and %zu (serial %llu)",
+             (unsigned long long)hit->p->key, full ? hit->marks.size() : (size_t)0, (unsigned long long)p->key, got.size(),
+             (unsigned long long)s.prog.serial);
+    if (memo.size() > 4096) memo.clear();
+    if (memo_prog.size() > 4096) memo_prog.clear();
+    memo_prog[s.prog.serial] = p;   // (programs are never freed)
+    Memo& m = memo[words_of(*p)];   // (the generations read before the lookups: one moved during them, the next one misses)
+    std::memcpy((void*)&m.prog, (const void*)&s.prog, sizeof m.prog);
+    m.p = p, m.reg = reg, m.dgen = dgen, m.hits = hits, m.epoch = ep;
+    m.words = words;
+    m.marks = got;
 }
 
 void draw_stats(int64_t* draws, int64_t* skipped, int64_t* dispatches, int64_t* pipes) {
