@@ -2516,8 +2516,13 @@ std::unique_ptr<Program> seed_translate(const SeedStage* const by_stage[8], cons
     auto p = std::make_unique<Program>();
     p->key = key;
     p->compute = by_stage[5] != nullptr;
-    p->mesh = by_stage[7] != nullptr;
-    if (p->mesh)
+    // (local, cachebug) as play makes it (mesh_program_locked): a fallback program is an ordinary graphics pipeline, never a native
+    // mesh one. mesh = true here kept the precompile's fallback records with both bits; the next start's precompile built the noted
+    // pipelines from them with no input assembly (points: the cyan speckle castle, no grass) under play's pipeline key
+    p->mesh = by_stage[7] && dev.mesh_shader;
+    p->fallback = by_stage[7] && !dev.mesh_shader;
+    if (by_stage[7] && !dev.mesh_shader && !dev.mesh_fallback) return nullptr;
+    if (by_stage[7])
         translate_mesh_into(*p, *blank, by_stage[6] ? &code[6] : nullptr, code[7], nullptr, by_stage[1] ? &code[1] : nullptr, color_types);
     else if (p->compute) {
         seed_cs_control = seed.blob.data() + by_stage[5]->control;
