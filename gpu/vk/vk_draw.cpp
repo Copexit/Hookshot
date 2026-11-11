@@ -5008,8 +5008,15 @@ thread_local uint32_t fallback_vertex_count = 0;
 // vertex count in the records buffer's word 0; the draw is then vkCmdDrawIndirect from its words 0-3 {count, 1, 0, 0}.
 // The shader side reads the same switch, and the program cache keys on RX_VK_MESH*
 thread_local VkBuffer fallback_indirect = VK_NULL_HANDLE;
+// (local, mesh-play) RX_VK_MESH_LEAN=1 (emit_spirv_mesh.cpp FallbackLean; implies RX_VK_MESH_COMPACT and PAYLOAD_WG): a task
+// program's mesh dispatch is indirect from the payload buffer's words lean_args..+2 {n started meshlets, 1, 1}, which the task
+// workgroups count up; no payload clear. Under RX_VK_MESH (the cache keys on it)
+bool fallback_lean() {
+    static const bool on = getenv("RX_VK_MESH_LEAN") != nullptr;
+    return on;
+}
 bool fallback_compact() {
-    static const bool on = getenv("RX_VK_MESH_COMPACT") != nullptr;
+    static const bool on = getenv("RX_VK_MESH_COMPACT") != nullptr || fallback_lean();
     return on;
 }
 // (local) RX_VK_MESH_FILL_USED=1: the payload buffer cleared only over the slots this draw's mesh dispatch reads (its flags and
@@ -5162,7 +5169,13 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     } else {
         vkCmdFillBuffer(cmd, f->records, 0, (VkDeviceSize)capacity * 4, 0);   // (the slots this draw runs)
     }
-    if (f->payload && fallback_fill_used()) {   // (local: only the slots the mesh dispatch below reads, [0, slots))
+    const uint32_t lean_args = capacity - 4;   // (emit_spirv_mesh.cpp LEAN_ARGS)
+    const bool lean{fallback_lean() && p.fallback_task && f->payload};
+    // (the payloads too: a mesh workgroup the task did not start still runs, and reads its payload's words)
+    if (lean) {   // (local, mesh-play: only the mesh dispatch's args {0, 1, 1}; no slot runs that no task wrote)
+        vkCmdFillBuffer(cmd, f->payload, (VkDeviceSize)lean_args * 4, 4, 0);
+        vkCmdFillBuffer(cmd, f->payload, (VkDeviceSize)lean_args * 4 + 4, 8, 1);
+    } else if (f->payload && fallback_fill_used()) {   // (local: only the slots the mesh dispatch below reads, [0, slots))
         if (slots) {
             vkCmdFillBuffer(cmd, f->payload, 0, (VkDeviceSize)slots * 4, 0);
             if (p.fallback_payload_words)
@@ -5184,7 +5197,9 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     auto send = [&](size_t stage, bool mesh_stage) {
         if (stage >= p.fallback_compute.size() || !p.fallback_compute[stage]) return false;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.fallback_compute[stage]);
-        if (mesh_stage && p.fallback_task) {
+        if (mesh_stage && lean) {
+            vkCmdDispatchIndirect(cmd, f->payload, (VkDeviceSize)lean_args * 4);
+        } else if (mesh_stage && p.fallback_task) {
             if (!slots) return true;
             vkCmdDispatch(cmd, slots, 1, 1);   // (one workgroup a slot; the task's flags cull those it did not start)
         } else if (d.indirect) {
@@ -5207,7 +5222,7 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
         if (!send(stages[0], false)) return false;
         full_barrier(cmd);
         if (!send(stages[1], true)) return false;
-        fallback_vertex_count = slots * p.fallback_vertices_per_workgroup;
+        fallback_vertex_count = (lean ? capacity : slots) * p.fallback_vertices_per_workgroup;
     } else {
         if (!send(stages[0], true)) return false;
         fallback_vertex_count = (d.indirect ? capacity : groups) * p.fallback_vertices_per_workgroup;

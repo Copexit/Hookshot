@@ -38,6 +38,36 @@ Id PushU64(EmitContext& ctx, u32 member);
 Id WorkgroupId(EmitContext& ctx);
 Id BufferWordAt(EmitContext& ctx, Id base, Id word);
 Id BufferWord(EmitContext& ctx, u32 member, Id word);
+Id LoadWord(EmitContext& ctx, Id pointer);
+
+/// (local, mesh-play) RX_VK_MESH_LEAN=1 (implies RX_VK_MESH_PAYLOAD_WG and RX_VK_MESH_COMPACT): the fallback runs one mesh
+/// workgroup a STARTED meshlet only. Each started task thread takes a slot with an atomic add on the payload buffer's word
+/// LEAN_ARGS (also the x of the mesh dispatch's indirect args {n, 1, 1}) and writes its task slot + 1 (wg * threads + i + 1)
+/// into that slot's flag word; the mesh workgroup reads its payload region and meshlet index from that. Before, an indirect
+/// task draw ran every slot (2048 mesh workgroups) after clearing the whole payload buffer (~6.5 MB a draw), and drew
+/// capacity * vertices. The flag words need no clear (every slot below n is written), the payload regions neither (only
+/// regions of task workgroups that started something are read). Under RX_VK_MESH (the cache keys on it).
+bool FallbackLean() {
+    static const bool on{std::getenv("RX_VK_MESH_LEAN") != nullptr};
+    return on;
+}
+constexpr u32 LEAN_ARGS = MESH_FALLBACK_CAPACITY - 4;   // (words LEAN_ARGS..+2: the mesh dispatch's {n, 1, 1}; slots below it)
+
+/// (mesh stage, lean) this workgroup's started task slot + 1, 0 when none (a slot past LEAN_ARGS: the count overflowed)
+Id LeanOrig(EmitContext& ctx) {
+    const Id slot{WorkgroupId(ctx)};
+    const Id word{LoadWord(ctx, BufferWord(ctx, ctx.mesh_fallback_payload_member_index,
+                                           ctx.OpUMin(ctx.U32[1], slot, ctx.Const(LEAN_ARGS - 1))))};
+    return ctx.OpSelect(ctx.U32[1], ctx.OpULessThan(ctx.U1, slot, ctx.Const(LEAN_ARGS)), word, ctx.u32_zero_value);
+}
+
+/// (lean) orig (a LeanOrig) - 1, divided (region) or modulo (meshlet) by the task threads; 0 when orig is 0
+Id LeanPart(EmitContext& ctx, Id orig, bool region) {
+    const Id threads{ctx.Const((std::max)(ctx.runtime_info.mesh_fallback_task_threads, 1U))};
+    const Id at{ctx.OpISub(ctx.U32[1], orig, ctx.Const(1U))};
+    return ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, orig, ctx.u32_zero_value), ctx.u32_zero_value,
+                        region ? ctx.OpUDiv(ctx.U32[1], at, threads) : ctx.OpUMod(ctx.U32[1], at, threads));
+}
 
 /// (local, missgeo-fix) RX_VK_MESH_PAYLOAD_WG=1: the task workgroup's payload is written out once, to its own region, and every
 /// mesh workgroup it started reads that region (slot / task threads), as natively every mesh workgroup reads the whole payload.
@@ -45,7 +75,7 @@ Id BufferWord(EmitContext& ctx, u32 member, Id word);
 /// (800-word payloads, meshlet count in word 5, per-meshlet arrays at words 6, 262, 518) then read a count of 0 in every slot
 /// but one and drew nothing: the Deku Tree's walls and roof, doors, blocks, platforms. Under RX_VK_MESH (the cache keys on it).
 bool FallbackPayloadWg() {
-    static const bool on{std::getenv("RX_VK_MESH_PAYLOAD_WG") != nullptr};
+    static const bool on{std::getenv("RX_VK_MESH_PAYLOAD_WG") != nullptr || FallbackLean()};
     return on;
 }
 
@@ -53,7 +83,9 @@ Id PayloadWord(EmitContext& ctx, Id index) {
     if (ctx.mesh_fallback && ctx.stage == Stage::Mesh && ctx.runtime_info.mesh_fallback_task) {
         // (the task wrote it out: the mesh workgroups are a later dispatch, one payload each)
         Id slot{WorkgroupId(ctx)};
-        if (FallbackPayloadWg() && ctx.runtime_info.mesh_fallback_task_threads)
+        if (FallbackLean())
+            slot = LeanPart(ctx, LeanOrig(ctx), true);
+        else if (FallbackPayloadWg() && ctx.runtime_info.mesh_fallback_task_threads)
             slot = ctx.OpUDiv(ctx.U32[1], slot, ctx.Const(ctx.runtime_info.mesh_fallback_task_threads));
         const Id first{ctx.OpIAdd(
             ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
@@ -149,7 +181,7 @@ u32 FallbackRecordWords(const MeshInfo& mesh) {
 /// under RX_VK_MESH, so the program cache keys on it. Primitives of different workgroups land in the order the workgroups
 /// finish, not by workgroup index.
 bool FallbackCompact() {
-    static const bool on{std::getenv("RX_VK_MESH_COMPACT") != nullptr};
+    static const bool on{std::getenv("RX_VK_MESH_COMPACT") != nullptr || FallbackLean()};
     return on;
 }
 
@@ -237,7 +269,7 @@ void MeshFallbackEpilogue(EmitContext& ctx) {
                             ctx.Const(mesh.max_primitives))};
         if (ctx.runtime_info.mesh_fallback_task) {
             // (a task thread starts at most one mesh workgroup: the slots it did not start output nothing)
-            const Id started{
+            const Id started{FallbackLean() ? LeanOrig(ctx) :
                 LoadWord(ctx, BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index), slot))};
             count = ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, started, ctx.u32_zero_value),
                                  ctx.u32_zero_value, count);
@@ -346,6 +378,31 @@ void TaskEpilogue(EmitContext& ctx) {
     // mesh workgroups for a draw held the GPU past Windows' two seconds, and the device was lost, on about half the first starts
     const Id count{ctx.OpUMin(ctx.U32[1], ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, ctx.Const(1U))),
                               ctx.Const(task_cap(ctx.mesh_threads)))};
+    if (ctx.mesh_fallback && FallbackLean()) {
+        // (local, mesh-play) RX_VK_MESH_LEAN: the payload once into region wg, then a packed slot for each started meshlet
+        const u32 words{ctx.mesh_info.payload_words};
+        const u32 threads{(std::max)(ctx.mesh_threads, 1U)};
+        const Id wg{WorkgroupId(ctx)};
+        const Id fits{ctx.OpULessThan(ctx.U1, wg, ctx.Const(MESH_FALLBACK_CAPACITY))};
+        If(ctx, ctx.OpLogicalAnd(ctx.U1, fits, ctx.OpINotEqual(ctx.U1, count, ctx.u32_zero_value)), [&] {
+            const Id first{ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY), ctx.OpIMul(ctx.U32[1], wg, ctx.Const(words)))};
+            Strided(ctx, words, threads, LocalInvocation(ctx), [&](Id index) {
+                StoreWord(ctx, BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index),
+                                            ctx.OpIAdd(ctx.U32[1], first, index)),
+                          ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, index)));
+            });
+        });
+        If(ctx, ctx.OpLogicalAnd(ctx.U1, fits, ctx.OpULessThan(ctx.U1, LocalInvocation(ctx), count)), [&] {
+            const Id at{ctx.OpAtomicIAdd(ctx.U32[1], BufferWord(ctx, ctx.mesh_fallback_payload_member_index, ctx.Const(LEAN_ARGS)),
+                                         ctx.Const(static_cast<u32>(spv::Scope::Device)), ctx.u32_zero_value, ctx.Const(1U))};
+            If(ctx, ctx.OpULessThan(ctx.U1, at, ctx.Const(LEAN_ARGS)), [&] {
+                StoreWord(ctx, BufferWord(ctx, ctx.mesh_fallback_payload_member_index, at),
+                          ctx.OpIAdd(ctx.U32[1], ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], wg, ctx.Const(threads)),
+                                                            LocalInvocation(ctx)), ctx.Const(1U)));
+            });
+        });
+        return;
+    }
     if (ctx.mesh_fallback) {
         // (no OpEmitMeshTasksEXT: the mesh workgroups are a fixed dispatch; each thread that started one writes its
         // payload to that workgroup's slot, so the mesh dispatch reads it back)
@@ -622,7 +679,8 @@ Id EmitIsbeRead(EmitContext& ctx, Id address) {
         // (the fallback's mesh workgroup is task workgroup w's slot w * threads + i, for its meshlet i. Natively the task's
         // OpEmitMeshTasksEXT numbers its mesh workgroups from 0: i, which the program takes as its meshlet's index. Given
         // the slot, every task workgroup but the first drew other meshlets' data, or none)
-        workgroup = ctx.OpUMod(ctx.U32[1], native_workgroup, ctx.Const(ctx.runtime_info.mesh_fallback_task_threads));
+        workgroup = FallbackLean() ? LeanPart(ctx, LeanOrig(ctx), false)
+                                   : ctx.OpUMod(ctx.U32[1], native_workgroup, ctx.Const(ctx.runtime_info.mesh_fallback_task_threads));
     }
     const Id index{ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.Const(2U))};
     const Id pointer{PayloadWord(ctx, index)};
