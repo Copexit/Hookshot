@@ -1170,7 +1170,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 st_barrier_flags[bits]++;
             }
             end_pass(cmd);
-            full_barrier(cmd, "barrier (the game's nvnCommandBufferBarrier)");
+            game_barrier(cmd, "barrier (the game's nvnCommandBufferBarrier)");   // (RX_VK_BARRIER_DEFER=1: merged with the next)
             st_barriers++;
             break;
         // ---- work ----
@@ -2769,6 +2769,15 @@ void log_frame_stats() {
                 fl += b;
             }
             logf("vk: a frame: the game's barriers by their NVN flags:%s", fl.c_str());
+            static const bool narrow_log = getenv("RX_VK_BARRIER_NARROW") || getenv("RX_VK_BARRIER_DEFER");
+            if (narrow_log) {   // (hookshot: RX_VK_BARRIER_NARROW / _DEFER, how many of the recorded ones were narrow)
+                static int64_t l_nar, l_def;
+                int64_t nar = 0, def = 0;
+                barrier_narrow_stats(&nar, &def);
+                logf("vk: a frame: %.1f of the recorded barriers narrow, %.1f of the game's held back", (nar - l_nar) / 120.0,
+                     (def - l_def) / 120.0);
+                l_nar = nar, l_def = def;
+            }
             st_barrier_flags.clear();
         }
         static int64_t l_gpu;

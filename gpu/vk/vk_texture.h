@@ -181,6 +181,15 @@ uint64_t texture_bytes();
 void full_barrier(VkCommandBuffer cmd, const char* why = "barrier (other)");
 /// Full barriers recorded and left out (RX_VK_BARRIER_DEDUPE_OFF=1: none), since the start
 void barrier_stats(int64_t* made, int64_t* left_out);
+/// (RX_VK_BARRIER_NARROW=1, RADV on GFX9) before work that reads and writes only through L2: a full barrier without its L2
+/// writeback and invalidate (vk_texture.cpp record_barrier says when that is safe); narrow_ok false, or off: full_barrier
+void consumer_barrier(VkCommandBuffer cmd, const char* why, const char* why_narrow, bool narrow_ok);
+/// (RX_VK_BARRIER_DEFER=1) the game's barrier, held back to merge with the next barrier on cmd; off: full_barrier
+void game_barrier(VkCommandBuffer cmd, const char* why);
+/// (narrow barriers) a pass attachment that radv keeps coherent with L2 on GFX9: single-sample, no stencil
+bool attachment_l2_coherent(const Texture* t);
+/// Narrow barriers recorded and game barriers held back, since the start
+void barrier_narrow_stats(int64_t* narrow, int64_t* deferred);
 void texture_stats(int64_t* uploads, int64_t* astc_gpu, int64_t* bytes_uploaded);
 /// RX_VK_DUMP_TEX: the textures uploaded next written to that folder as PPM (diagnostics)
 void texture_read_texels(const nvn_tex* t, unsigned level, unsigned layer0, const NVNcopyRegion* r, uint8_t* dst,

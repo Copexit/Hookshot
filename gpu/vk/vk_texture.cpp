@@ -1843,42 +1843,143 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
 } // namespace
 
 std::atomic<uint64_t> work_epoch{0};
+thread_local VkCommandBuffer barrier_pending_cmd = VK_NULL_HANDLE;   // (RX_VK_BARRIER_DEFER: the game's barrier not recorded yet)
 namespace {
 // (each thread's own: the display thread's present records barriers too)
 thread_local VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;   // (the command buffer this thread's last full barrier went into, and the work count then)
 thread_local uint64_t last_barrier_epoch = 0;
-std::atomic<int64_t> st_barriers_made{0}, st_barriers_left_out{0};
+thread_local bool last_barrier_full = true;   // (RX_VK_BARRIER_NARROW: whether that last one was a full one, not a narrow one)
+thread_local const char* barrier_pending_why = nullptr;
+std::atomic<int64_t> st_barriers_made{0}, st_barriers_left_out{0}, st_barriers_narrow{0}, st_barriers_deferred{0};
 } // namespace
 void barrier_stats(int64_t* made, int64_t* left_out) {
     *made = st_barriers_made.load(std::memory_order_relaxed), *left_out = st_barriers_left_out.load(std::memory_order_relaxed);
+}
+void barrier_narrow_stats(int64_t* narrow, int64_t* deferred) {
+    *narrow = st_barriers_narrow.load(std::memory_order_relaxed), *deferred = st_barriers_deferred.load(std::memory_order_relaxed);
+}
+
+// (hookshot, RX_VK_BARRIER_NARROW=1) A narrow barrier: the full one's stages and destination accesses, no source access. Only with
+// RADV on a GFX9 GPU (Vega, Raven, Renoir/Cezanne), where Mesa 26.0's radv_barrier turns the full one into: CS + PS partial flush
+// (the stages), CB/DB data and metadata flushed and invalidated, K$ and L1 invalidated, L2 metadata invalidated (the destination
+// side: MEMORY_READ on all commands takes in COLOR/DEPTH_STENCIL_ATTACHMENT_READ, which flush CB/DB when no image is named), and
+// from the source side the same CB/DB flushes plus INV_L2: a writeback and invalidate of the whole L2 (radv_src_access_flush sets it
+// for every write access of a barrier that names no image). The narrow one leaves out only that INV_L2. On GFX9 the L2 is where
+// shaders, CP (indirect arguments, CP DMA) and single-sample colour and non-stencil depth attachments meet, so nothing it held is
+// stale for them; the destination side still invalidates L2 when the command buffer rendered to an attachment that bypasses it
+// (MSAA, stencil: radv's rb_noncoherent_dirty). What the L2 writeback is for, an RB that bypasses L2 reading what is dirty there,
+// is why the callers use it only before a dispatch or a pass whose attachments are all L2-coherent, and why the first barrier of a
+// command buffer stays full (radv's rb_noncoherent_dirty starts clean in each). Every later consumer has a barrier of its own
+// before it (pass start, dispatch, copies, clears, uniform updates, events, recording end), and a full one is never left out for
+// a narrow one before it.
+static bool narrow_on() {
+    if (!hc_flag[HC_BARRIER_NARROW]) return false;
+    static const bool on = [] {   // (the GPU: asked once, the first time the switch is on)
+        VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &dp;
+        if (dev.physical) vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        const char* n = p2.properties.deviceName;
+        const bool gfx9 = dp.driverID == VK_DRIVER_ID_MESA_RADV &&
+                          (strstr(n, "VEGA") || strstr(n, "RAVEN") || strstr(n, "RENOIR"));
+        logf("vk: narrow barriers (RX_VK_BARRIER_NARROW): %s (%s)", gfx9 ? "on" : "OFF, RADV on a GFX9 GPU only", n);
+        return gfx9;
+    }();
+    return on;
+}
+static bool defer_on() {
+    return hc_flag[HC_BARRIER_DEFER] != 0;
+}
+
+static void record_barrier(VkCommandBuffer cmd, const char* why, bool narrow) {
+    static const bool off = getenv("RX_VK_BARRIER_DEDUPE_OFF") != nullptr;
+    const bool dedupe = !off && !par_active.load(std::memory_order_relaxed);   // (a parallel replay's threads share command buffers and the count)
+    if (dedupe && cmd == last_barrier_cmd && work_epoch.load(std::memory_order_relaxed) == last_barrier_epoch &&
+        (last_barrier_full || narrow)) {   // (a narrow one does not stand in for a full one)
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    st_barriers_made.fetch_add(1, std::memory_order_relaxed);
+    if (narrow) st_barriers_narrow.fetch_add(1, std::memory_order_relaxed);
+    GprofSpan gp(cmd, why);   // (RX_VK_PASS_TIMING: what a barrier costs the GPU that has nothing left to wait for)
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    if (narrow) {   // (the reads named as well: what radv flushes for them does not hang on how it expands MEMORY_READ)
+        b.srcAccessMask = VK_ACCESS_2_NONE;
+        b.dstAccessMask |= VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
+                           VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                           VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                           VK_ACCESS_2_TRANSFER_READ_BIT;
+    }
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+    last_barrier_cmd = cmd, last_barrier_epoch = work_epoch.load(std::memory_order_relaxed), last_barrier_full = !narrow;
+}
+
+void barrier_flush_pending() {   // (vk_work.h: before any command that does GPU work, and before a command buffer ends)
+    const VkCommandBuffer c = barrier_pending_cmd;
+    if (!c) return;
+    barrier_pending_cmd = VK_NULL_HANDLE;   // (first: the barrier's own vkCmdPipelineBarrier2 comes back through note_work)
+    record_barrier(c, barrier_pending_why, false);
 }
 
 // (hookshot) A full barrier right after another one on the same command buffer, no command that does or orders GPU work in between
 // (vk_work.h counts them), orders nothing the first did not: left out. The game's own barrier (end of a pass), then the next pass's
 // start barrier, then a dispatch's, were two or three in a row. RX_VK_BARRIER_DEDUPE_OFF=1: all recorded, as before.
 void full_barrier(VkCommandBuffer cmd, const char* why) {
-    static const bool off = getenv("RX_VK_BARRIER_DEDUPE_OFF") != nullptr;
-    const bool dedupe = !off && !par_active.load(std::memory_order_relaxed);   // (a parallel replay's threads share command buffers and the count)
-    if (dedupe && cmd == last_barrier_cmd && work_epoch.load(std::memory_order_relaxed) == last_barrier_epoch) {
-        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+    if (barrier_pending_cmd) {
+        if (barrier_pending_cmd == cmd) {   // (the game's barrier and this one in a row: one, full)
+            barrier_pending_cmd = VK_NULL_HANDLE;
+            why = barrier_pending_why;
+        } else {
+            barrier_flush_pending();
+        }
+    }
+    record_barrier(cmd, why, false);
+}
+
+/// (RX_VK_BARRIER_NARROW) narrow_ok: the work right after it reads and writes only through L2 (a dispatch, or a pass whose
+/// attachments are all L2-coherent); otherwise, or off, or not this command buffer's first: full_barrier
+void consumer_barrier(VkCommandBuffer cmd, const char* why, const char* why_narrow, bool narrow_ok) {
+    const bool merged = barrier_pending_cmd == cmd && cmd;
+    // (a parallel replay's segments too: each worker records its own command buffer, and last_barrier_cmd is the thread's, reset
+    // when a recording begins, so a segment's first barrier is full)
+    const bool narrow = narrow_ok && narrow_on() && cmd == last_barrier_cmd;
+    if (!narrow) {
+        full_barrier(cmd, why);
         return;
     }
-    st_barriers_made.fetch_add(1, std::memory_order_relaxed);
-    GprofSpan gp(cmd, why);   // (RX_VK_PASS_TIMING: what a barrier costs the GPU that has nothing left to wait for)
-    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-    b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    d.memoryBarrierCount = 1;
-    d.pMemoryBarriers = &b;
-    vkCmdPipelineBarrier2(cmd, &d);
-    last_barrier_cmd = cmd, last_barrier_epoch = work_epoch.load(std::memory_order_relaxed);
+    if (merged) barrier_pending_cmd = VK_NULL_HANDLE;   // (the game's barrier, held back for this one: narrow too)
+    else barrier_flush_pending();
+    record_barrier(cmd, merged ? "barrier (the game's nvnCommandBufferBarrier, narrow)" : why_narrow, true);
+}
+
+/// (RX_VK_BARRIER_DEFER=1) the game's barrier held back until the next barrier on this command buffer (and merged with it, narrow
+/// if that one is), or the next command that does GPU work, or the command buffer's end (vk_work.h), when it is recorded full
+void game_barrier(VkCommandBuffer cmd, const char* why) {
+    if (!defer_on()) {   // (a parallel replay's workers each hold their own: it is the thread's, and their command buffers their own)
+        full_barrier(cmd, why);
+        return;
+    }
+    if (barrier_pending_cmd && barrier_pending_cmd != cmd) barrier_flush_pending();
+    barrier_pending_cmd = cmd, barrier_pending_why = why;
+    st_barriers_deferred.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool attachment_l2_coherent(const Texture* t) {
+    // (radv_image_is_l2_coherent on GFX9: single-sample, colour or depth without stencil)
+    return t && t->samples == VK_SAMPLE_COUNT_1_BIT && !has_stencil(t->format) && t->format != VK_FORMAT_D16_UNORM_S8_UINT;
 }
 
 void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
+    barrier_flush_pending();   // (normally none: a command buffer's end records it, vk_work.h; one still open gets it here)
     last_barrier_cmd = VK_NULL_HANDLE;   // (a new recording: its command buffers start afresh, whatever their handles held)
     up_cmd = upload;
+    up_work = 0;
     if (value != rec_value) epoch++;   // (a submission's parts check a texture's memory once: nothing is collected between)
     rec_value = value;
     up_used = false;

@@ -10,13 +10,20 @@
 
 namespace mkwvk {
 extern std::atomic<uint64_t> work_epoch;   // (vk_texture.cpp)
+extern thread_local VkCommandBuffer barrier_pending_cmd;   // (vk_texture.cpp, RX_VK_BARRIER_DEFER: the game's barrier held back)
+void barrier_flush_pending();
 inline void note_work() {
+    if (barrier_pending_cmd) barrier_flush_pending();   // (recorded before the work, on the command buffer it was for)
     // (an add, not a load and a store: a thread preempted between the two would store a stale count over another thread's, which could
     // make the count equal the one a barrier was recorded at with work recorded since, and the next barrier is left out for it)
     work_epoch.fetch_add(1, std::memory_order_relaxed);
 }
+inline void note_end(VkCommandBuffer c) {   // (a held-back barrier goes in before its command buffer ends)
+    if (barrier_pending_cmd == c && c) barrier_flush_pending();
+}
 } // namespace mkwvk
 
+#define vkEndCommandBuffer(c) (::mkwvk::note_end(c), ::vkx::vkEndCommandBuffer(c))
 #define vkCmdPipelineBarrier2(...) (::mkwvk::note_work(), ::vkx::vkCmdPipelineBarrier2(__VA_ARGS__))
 #define vkCmdBeginRendering(...) (::mkwvk::note_work(), ::vkx::vkCmdBeginRendering(__VA_ARGS__))
 #define vkCmdEndRendering(...) (::mkwvk::note_work(), ::vkx::vkCmdEndRendering(__VA_ARGS__))

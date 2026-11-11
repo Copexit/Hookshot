@@ -3057,7 +3057,11 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     for (int i = 0; i < at.n && same; i++) same = pass().color[i] == at.color_view[i];
     if (same) return;
     end_pass(cmd);
-    full_barrier(cmd, "barrier (pass start)");   // (what the pass before wrote, and the transfers before it)
+    // (what the pass before wrote, and the transfers before it. RX_VK_BARRIER_NARROW: narrow when every attachment is a texture
+    // radv keeps L2-coherent on GFX9, so the pass's RB reads them through L2 as its shaders read the rest)
+    bool l2_ok = !at.depth_view || attachment_l2_coherent(at.depth);
+    for (int i = 0; i < at.n && l2_ok; i++) l2_ok = !at.color_view[i] || attachment_l2_coherent(at.color[i]);
+    consumer_barrier(cmd, "barrier (pass start)", "barrier (pass start, narrow)", l2_ok);
     work_since_barrier = true;
     VkRenderingAttachmentInfo ca[8]{};
     bool marks = !texture_marked(at.depth);
