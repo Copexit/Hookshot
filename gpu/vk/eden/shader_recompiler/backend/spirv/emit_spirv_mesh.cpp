@@ -39,10 +39,22 @@ Id WorkgroupId(EmitContext& ctx);
 Id BufferWordAt(EmitContext& ctx, Id base, Id word);
 Id BufferWord(EmitContext& ctx, u32 member, Id word);
 
+/// (local, missgeo-fix) RX_VK_MESH_PAYLOAD_WG=1: the task workgroup's payload is written out once, to its own region, and every
+/// mesh workgroup it started reads that region (slot / task threads), as natively every mesh workgroup reads the whole payload.
+/// Without it each slot gets only the words of its thread's lane (i, i + threads, ...): OoT's level-geometry task programs
+/// (800-word payloads, meshlet count in word 5, per-meshlet arrays at words 6, 262, 518) then read a count of 0 in every slot
+/// but one and drew nothing: the Deku Tree's walls and roof, doors, blocks, platforms. Under RX_VK_MESH (the cache keys on it).
+bool FallbackPayloadWg() {
+    static const bool on{std::getenv("RX_VK_MESH_PAYLOAD_WG") != nullptr};
+    return on;
+}
+
 Id PayloadWord(EmitContext& ctx, Id index) {
     if (ctx.mesh_fallback && ctx.stage == Stage::Mesh && ctx.runtime_info.mesh_fallback_task) {
         // (the task wrote it out: the mesh workgroups are a later dispatch, one payload each)
-        const Id slot{WorkgroupId(ctx)};
+        Id slot{WorkgroupId(ctx)};
+        if (FallbackPayloadWg() && ctx.runtime_info.mesh_fallback_task_threads)
+            slot = ctx.OpUDiv(ctx.U32[1], slot, ctx.Const(ctx.runtime_info.mesh_fallback_task_threads));
         const Id first{ctx.OpIAdd(
             ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
             ctx.OpIMul(ctx.U32[1], slot, ctx.Const(ctx.mesh_info.payload_words)))};
@@ -144,6 +156,15 @@ bool FallbackCompact() {
 /// (local) RX_VK_MESH_EARLYOUT=1: see EmitMeshFallbackVertexBody. Without RX_VK_MESH_COMPACT only (with it no vertex is dead).
 bool FallbackEarlyOut() {
     static const bool on{std::getenv("RX_VK_MESH_EARLYOUT") != nullptr};
+    return on;
+}
+
+/// (local, missgeo-b) RX_VK_MESH_PAYLOAD_FULL=1: each started slot gets the task workgroup's whole payload, as natively every
+/// mesh workgroup reads all of it. Without it thread i copies words i, i + threads, ... into its own slot only: right when the
+/// program keeps one 32-word lane a meshlet and has 32 task threads, wrong for a header word every mesh workgroup reads (only
+/// the slot of that word's lane gets it) or for other thread counts. A test switch under RX_VK_MESH (the cache keys on it).
+bool FallbackPayloadFull() {
+    static const bool on{std::getenv("RX_VK_MESH_PAYLOAD_FULL") != nullptr};
     return on;
 }
 
@@ -340,6 +361,7 @@ void TaskEpilogue(EmitContext& ctx) {
             // parser rejects and its release build crashed on)
             StoreWord(ctx, BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index), slot),
                       ctx.OpSelect(ctx.U32[1], started, ctx.Const(1U), ctx.u32_zero_value));
+            if (FallbackPayloadFull() || FallbackPayloadWg()) return;
             If(ctx, started, [&] {
                 const Id first{ctx.OpIAdd(
                     ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
@@ -352,6 +374,40 @@ void TaskEpilogue(EmitContext& ctx) {
                 });
             });
         });
+        if (FallbackPayloadWg()) {
+            // (local, missgeo-fix) the whole payload once, into this task workgroup's region (the mesh side reads slot / threads)
+            const u32 words{ctx.mesh_info.payload_words};
+            const u32 threads{(std::max)(ctx.mesh_threads, 1U)};
+            const Id wg{WorkgroupId(ctx)};
+            If(ctx, ctx.OpLogicalAnd(ctx.U1, ctx.OpULessThan(ctx.U1, ctx.OpIMul(ctx.U32[1], wg, ctx.Const(threads)),
+                                                             ctx.Const(MESH_FALLBACK_CAPACITY)),
+                                     ctx.OpINotEqual(ctx.U1, count, ctx.u32_zero_value)), [&] {
+                const Id first{ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY), ctx.OpIMul(ctx.U32[1], wg, ctx.Const(words)))};
+                Strided(ctx, words, threads, LocalInvocation(ctx), [&](Id index) {
+                    StoreWord(ctx, BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index),
+                                                ctx.OpIAdd(ctx.U32[1], first, index)),
+                              ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, index)));
+                });
+            });
+        }
+        if (FallbackPayloadFull()) {
+            // (local, missgeo-b) the threads together copy (started meshlet j, word w) pairs: k = j * words + w
+            const u32 words{ctx.mesh_info.payload_words};
+            const u32 threads{(std::max)(ctx.mesh_threads, 1U)};
+            Strided(ctx, threads * words, threads, LocalInvocation(ctx), [&](Id k) {
+                const Id j{ctx.OpUDiv(ctx.U32[1], k, ctx.Const(words))};
+                const Id w{ctx.OpUMod(ctx.U32[1], k, ctx.Const(words))};
+                const Id dst{ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], WorkgroupId(ctx), ctx.Const(threads)), j)};
+                If(ctx, ctx.OpULessThan(ctx.U1, j, count), [&] {
+                    If(ctx, ctx.OpULessThan(ctx.U1, dst, ctx.Const(MESH_FALLBACK_CAPACITY)), [&] {
+                        const Id at{ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
+                                               ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], dst, ctx.Const(words)), w))};
+                        StoreWord(ctx, BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index), at),
+                                  ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, w)));
+                    });
+                });
+            });
+        }
         return;
     }
     const Id one{ctx.Const(1U)};

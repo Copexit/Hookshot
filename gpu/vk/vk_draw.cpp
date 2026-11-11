@@ -5135,10 +5135,23 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     const bool indirect{d.indirect && mesh_conv_buf != VK_NULL_HANDLE};
     const uint32_t groups{(uint32_t)std::clamp(d.groups[0], 0, (int)capacity)};
     // (a task workgroup's slots are wg * threads + thread: those past the buffer are not started)
-    const uint32_t slots{p.fallback_task
-                             ? (uint32_t)std::min<uint64_t>(
-                                   (uint64_t)groups * std::max(1u, p.fallback_task_threads), capacity)
-                             : 0};
+    // (local, missgeo-b) An indirect draw's task workgroup count is on the GPU, and its groups[0] is 0: it ran its task
+    // dispatch, then no mesh workgroup (0 slots) and a 0-vertex draw, still counted as drawn. Every slot runs now; the ones no
+    // task started read a cleared flag and draw nothing. RX_VK_FB_IND_SLOTS0=1: as before
+    static const bool ind_slots0 = getenv("RX_VK_FB_IND_SLOTS0") != nullptr;
+    const uint32_t slots{!p.fallback_task ? 0
+                         : d.indirect && !ind_slots0
+                             ? capacity
+                             : (uint32_t)std::min<uint64_t>(
+                                   (uint64_t)groups * std::max(1u, p.fallback_task_threads), capacity)};
+    {   // (local, missgeo-b) what the fixed capacity cuts off a direct draw: its meshlets past it are never drawn
+        const uint64_t want = p.fallback_task ? (uint64_t)std::max(d.groups[0], 0) * std::max(1u, p.fallback_task_threads)
+                                              : (uint64_t)std::max(d.groups[0], 0);
+        static std::atomic<int> told{0};
+        if (!d.indirect && want > capacity && told++ < 16)
+            logf("vk: fallback: %016llx draws %llu mesh workgroups, %u fit (issue 640): the rest left out",
+                 (unsigned long long)p.key, (unsigned long long)want, capacity);
+    }
     end_pass(cmd);
     full_barrier(cmd);   // (local: the last fallback draw read these buffers; shared now, so before they are cleared)
     if (fallback_compact()) {   // (local: words 0-3 the indirect draw's {0 vertices, 1 instance, 0, 0}; the slot counts are
@@ -5610,7 +5623,13 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             mesh_args = {mesh_args_buffer, (VkDeviceSize)mesh_args_at * 16, (VkDeviceSize)n * 16, 0};
         }
     }
-    if (p.fallback && d.mesh && !fallback_record(cmd, p, d)) SKIP_HERE();
+    if (p.fallback && d.mesh && !fallback_record(cmd, p, d)) {
+        static std::atomic<int> told{0};   // (local, missgeo-b: most of its reasons were silent)
+        if (told++ < 16)
+            logf("vk: fallback: mesh draw of %016llx left out (task %d, groups %d, indirect %#llx)", (unsigned long long)p.key,
+                 (int)p.fallback_task, d.groups[0], (unsigned long long)d.indirect);
+        SKIP_HERE();
+    }
     {
         FINE_SCOPE(FT_HAZARD);
         begin_pass(cmd, at);
