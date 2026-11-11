@@ -432,7 +432,8 @@ void TaskEpilogue(EmitContext& ctx) {
             });
         });
         If(ctx, ctx.OpLogicalAnd(ctx.U1, fits, ctx.OpULessThan(ctx.U1, LocalInvocation(ctx), count)), [&] {
-            const Id at{ctx.OpAtomicIAdd(ctx.U32[1], BufferWord(ctx, ctx.mesh_fallback_payload_member_index, ctx.Const(LEAN_ARGS)),
+            // (the count is the records buffer's word 5: words 5-7 are the mesh dispatch's {n, 1, 1}, after the draw's 0-4)
+            const Id at{ctx.OpAtomicIAdd(ctx.U32[1], BufferWord(ctx, ctx.mesh_fallback_records_member_index, ctx.Const(5U)),
                                          ctx.Const(static_cast<u32>(spv::Scope::Device)), ctx.u32_zero_value, ctx.Const(1U))};
             If(ctx, ctx.OpULessThan(ctx.U1, at, ctx.Const(LEAN_ARGS)), [&] {
                 StoreWord(ctx, BufferWord(ctx, ctx.mesh_fallback_payload_member_index, at),
